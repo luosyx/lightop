@@ -35,6 +35,18 @@ python3 setup.py bdist_wheel
 
 产物位于 `dist/`。可通过 `MAX_JOBS` 控制编译并行度，例如 `MAX_JOBS=32 python3 setup.py install`。
 
+少伯（`gfx946`）的 FP4 分页及稀疏 MQA 使用原生 FP4 MMAC，需要编译器支持
+`__builtin_hcu_mmac_f32_16x16x64_fp4_lit_lts`，并安装包含 GFX946 device library
+的 DTK。切换 `/opt/dtk` 后重新加载环境，构建时显式指定目标架构：
+
+```bash
+source /opt/dtk/env.sh
+PYTORCH_ROCM_ARCH=gfx946 MAX_JOBS=32 python3 setup.py bdist_wheel
+```
+
+如需同时包含其他架构，可设置 `PYTORCH_ROCM_ARCH='gfx938;gfx946'`。仅有 DTK
+版本标签不能确认编译器支持情况，应先确认其能编译上述内建函数和 `gfx946` 目标。
+
 ## 使用示例
 
 通过归一化分类 `lightop.norm` 调用 RMSNorm；HIP 版 PyTorch 同样使用 `device="cuda"` 访问 HCU：
