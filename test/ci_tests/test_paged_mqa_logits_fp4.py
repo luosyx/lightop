@@ -247,8 +247,8 @@ def op():
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
     arch = torch.cuda.get_device_properties(0).gcnArchName
-    if not arch.startswith(("gfx928", "gfx936", "gfx938")):
-        pytest.skip("FP4 paged logits require gfx928/936/938")
+    if not arch.startswith(("gfx928", "gfx936", "gfx938", "gfx946")):
+        pytest.skip("FP4 paged logits require gfx928/936/938/946")
     return get_operator()
 
 
@@ -300,11 +300,11 @@ def test_block_scale_span_boundary(op, span):
 
 def test_schedule_persistent(op):
     """The split-KV schedule selects the persistent kernel and must match."""
-    from lightop.attention import get_paged_mqa_logits_metadata
+    from lightop.attention import get_paged_mqa_logits_fp4_metadata
     case = make_case(4, 32, 8193, seed=23)
     case[4].copy_(torch.tensor([0, 1, 4097, 8193], device="cuda", dtype=torch.int32))
     cus = torch.cuda.get_device_properties(0).multi_processor_count
-    schedule = get_paged_mqa_logits_metadata(case[4], 64, cus)
+    schedule = get_paged_mqa_logits_fp4_metadata(case[4], 64, cus)
     check(op, case, schedule_meta=schedule)
 
 
@@ -370,13 +370,13 @@ def test_rows_per_request_matches_unpaired(op, draft, heads, with_schedule, requ
     """Scoring a request's rows in pairs over one KV read must not change a bit
     of any row, whatever dispatch (FP8 fold or BF16) each row takes; below the
     pairing gate the same call has to fall back to one row per route."""
-    from lightop.attention import get_paged_mqa_logits_metadata, paged_mqa_logits_route_lens
+    from lightop.attention import get_paged_mqa_logits_fp4_metadata, paged_mqa_logits_route_lens
     case = verify_case(draft, heads, 2049, seed=draft * 100 + heads, requests=requests)
     width = table_width(case, 64)
     cus = torch.cuda.get_device_properties(0).multi_processor_count
 
     def schedule(lens):
-        return get_paged_mqa_logits_metadata(lens, 64, cus) if with_schedule else None
+        return get_paged_mqa_logits_fp4_metadata(lens, 64, cus) if with_schedule else None
 
     want = run(op, case, width, schedule_meta=schedule(case[4]))
     got = run(op, case, width, rows_per_request=draft,
@@ -496,6 +496,40 @@ def test_all_nibbles_exact(op, span, group, q_code):
     got = run(op, case, 64)
     expected, _ = reference_with_bound(case, 64, 64)
     torch.testing.assert_close(got, expected.float(), rtol=0, atol=0)
+
+
+def test_all_channels_and_heads_exact(op):
+    """One nonzero K channel per token exposes packed-MMAC lane permutations.
+
+    Each query row selects a different head, with distinct Q/K scales in all
+    four K32 groups. Every FP4 nibble position and output accumulator lane is
+    checked without a summation tolerance hiding a misplaced value.
+    """
+    heads, length = 64, 128
+    channels = torch.arange(length, device="cuda")
+    rows = torch.arange(heads, device="cuda")
+    q_codes = (rows[:, None] + channels[None, :] +
+               (channels[None, :] // 16) * (1 + rows[:, None] % 3)) % 16
+    q_payload = (q_codes[:, 0::2] | (q_codes[:, 1::2] << 4)).to(torch.uint8)
+    q_payload = q_payload[None].expand(heads, -1, -1).contiguous()
+    q_scales = (123 + (rows[:, None] % 5) + torch.tensor(
+        [0, 3, 7, 11], device="cuda")[None]).to(torch.uint8)
+    q, q_sf = pack_q(q_payload, q_scales[None].expand(heads, -1, -1).contiguous())
+    k_payload = torch.zeros(length, 64, device="cuda", dtype=torch.uint8)
+    k_codes = ((channels * 3 + 1) % 16).to(torch.uint8)
+    k_payload[channels, channels // 2] = (k_codes << ((channels % 2) * 4)).to(torch.uint8)
+    k_scales = torch.tensor([130, 124, 135, 121], device="cuda", dtype=torch.uint8)
+    pool = assemble_pool(k_payload, k_scales[None].expand(length, -1).contiguous())
+    weights = torch.eye(heads, device="cuda")
+    lens = torch.full((heads,), length, device="cuda", dtype=torch.int32)
+    table = torch.tensor([0, 1], device="cuda", dtype=torch.int32)[None].expand(heads, -1).contiguous()
+    case = [q, q_sf, pool, weights, lens, table]
+    got = run(op, case, length)
+    lut = torch.tensor(CODES, device="cuda")
+    scale = torch.exp2(q_scales.float().repeat_interleave(32, dim=-1) +
+                      k_scales.float().repeat_interleave(32)[None] - 254)
+    expected = (lut[q_codes] * lut[k_codes.long()][None] * scale).relu()
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("heads", [16, 32])
