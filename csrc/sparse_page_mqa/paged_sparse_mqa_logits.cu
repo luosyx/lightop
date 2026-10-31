@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
 
-// Shared gfx936/gfx938 sparse-MQA source tree.
+// Shared gfx936/gfx938/gfx946 sparse-MQA source tree. gfx946 uses the
+// persistent pair consumer with native FP4 MMAC for decode and prefill.
 // Both implementations are compiled into this translation unit. Architecture
 // selection is a host property lookup; it adds no tensor copy or GPU launch.
 // gfx936 implementation.
@@ -35,6 +36,7 @@
 // An exponent-normalized FP32 scalar path handles exceptional scale ranges;
 // there are no FP64 operations and no BF16 weights/output branch.
 #include "paged_sparse_mqa_logits.h"
+#include "../paged_mqa_logits/fp4_mmac.h"
 #include "paged_sparse_mqa_logits_initialization.h"
 #include "paged_sparse_mqa_logits_metadata.h"
 #include <ATen/hip/HIPContext.h>
@@ -530,17 +532,21 @@ __global__ void sparse_fp8_fp4_paged_mqa_logits__decode_pair(Args a) {
                 // Decode once into each format needed by a live normal row.
                 // Other positions are zero operands, including a paired row's
                 // exclusive exceptional candidates. The fallback uses raw codes.
-                const bool need_bf16 = (normal[0] && !fp8[0]) || (normal[1] && !fp8[1]);
+                const bool need_bf16 =
+#if defined(__gfx946__)
+                    !FP4 &&
+#endif
+                    ((normal[0] && !fp8[0]) || (normal[1] && !fp8[1]));
                 const bool bf16_live = (normal[0] && !fp8[0] && valid[0]) ||
                                        (normal[1] && !fp8[1] && valid[1]);
                 bf16x4 kbf[8];
+                uintx4 kb;
 #if defined(__gfx938__)
                 const bool need_fp8 = fp8[0] || fp8[1];
                 const bool fp8_live = (fp8[0] && valid[0]) || (fp8[1] && valid[1]);
                 intx2 k8[4];
 #endif
                 if constexpr (!FallbackOnly) {
-                    uintx4 kb;
                     if constexpr (FP4) {
                         bool decode_live = bf16_live;
 #if defined(__gfx938__)
@@ -583,11 +589,19 @@ __global__ void sparse_fp8_fp4_paged_mqa_logits__decode_pair(Args a) {
 #pragma unroll
                         for (int h = 0; h < HT; ++h) acc[h] = floatx4{0,0,0,0};
                         float residual = 1.f;
-                        bool used_fp8 = false;
+                        bool used_lowp = false;
+#if defined(__gfx946__)
+                        if constexpr (FP4) {
+#pragma unroll
+                            for (int h = 0; h < HT; ++h)
+                                acc[h] = fp4_detail::mmac_scaled_fp4(kb, sf, q.bits[h], q.sf[h]);
+                            used_lowp = true;
+                        }
+#endif
 #if defined(__gfx938__)
                         const int e = q.pivot + pk - 127;
                         if constexpr (FP4) {
-                            used_fp8 = fp8[i];
+                            used_lowp = fp8[i];
                             if (fp8[i]) {
 #pragma unroll
                                 for (int s = 0; s < 4; ++s) {
@@ -599,7 +613,7 @@ __global__ void sparse_fp8_fp4_paged_mqa_logits__decode_pair(Args a) {
                             }
                         }
 #endif
-                        if (!used_fp8) {
+                        if (!used_lowp) {
 #pragma unroll
                             for (int s = 0; s < 8; ++s) {
 #pragma unroll
@@ -3435,7 +3449,8 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(
     TORCH_CHECK(hipGetDeviceProperties(&prop,q.get_device()) == hipSuccess,
                 "fp8_fp4_paged_sparse_mqa_logits: cannot query HIP device");
     const std::string arch(prop.gcnArchName);
-    TORCH_CHECK(arch.rfind("gfx938",0) == 0 || arch.rfind("gfx936",0) == 0 || arch.rfind("gfx928",0) == 0,
+    TORCH_CHECK(arch.rfind("gfx938",0) == 0 || arch.rfind("gfx936",0) == 0 || arch.rfind("gfx928",0) == 0 ||
+                (fp4 && arch.rfind("gfx946",0) == 0),
                 "fp8_fp4_paged_sparse_mqa_logits: unsupported architecture ",arch);
     const int64_t num_sms = num_sms_opt.value_or(prop.multiProcessorCount);
     TORCH_CHECK(num_sms > 0 && num_sms <= 256, "fp8_fp4_paged_sparse_mqa_logits: num_sms must be in [1,256]");
@@ -3898,7 +3913,7 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(
     } \
 } while (0)
 #define LAUNCH(FP4,HT,BLOCK) do { \
-    if (is_prefill) { \
+    if (is_prefill && arch.rfind("gfx946",0) != 0) { \
         if constexpr (FP4) { \
             if (arch.rfind("gfx938",0) == 0) { \
                 PREFILL_CALL(FP4,HT,BLOCK,false,true,false); \
@@ -7774,8 +7789,9 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(
             num_max_sparse_blocks, sparse_block_kv, context_lens,
             sparse_kv_block_indices, output, num_sms, is_prefill);
     }
-    // gfx936 retains BF16 MMAC and its adaptive packed-K path. gfx928 and
-    // unsupported devices retain the original implementation's validation.
+    // gfx936 retains BF16 MMAC and its adaptive packed-K path. gfx946 uses
+    // native FP4 in the persistent pair consumer; other devices are validated
+    // by the original implementation.
     return gfx936_detail::fp8_fp4_paged_sparse_mqa_logits(
         q, q_scales, fused_kv_cache, weights, metadata,
         num_max_sparse_blocks, sparse_block_kv, context_lens,
