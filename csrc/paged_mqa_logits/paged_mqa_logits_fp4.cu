@@ -17,6 +17,8 @@
 // 128 products of a head enter one FP32 accumulator, and relu, the head weight
 // and the head reduction stay in FP32 (DeepGEMM's block-scaled MMA contract).
 //
+// gfx946 uses native FP4 MMAC with each K32 scale restored before the head
+// reduction. Exceptional scales retain the BF16 path below.
 // gfx938 has no FP4 MMAC. E2M1 codes are m * 2^e with e in [-1, 2]; shifting
 // the E4M3 exponent field by a per-block delta in [-6, 5] encodes a block's
 // value times 2^(scale - pivot) exactly. With one pivot per query row and one
@@ -52,6 +54,7 @@
 // each row still stops writing at its own length. Pairing needs H <= 32 (two
 // rows' Q in VGPRs) and is skipped below kPagedMqaLogitsFp4PairMinRequests.
 #include "paged_mqa_logits_fp4.h"
+#include "fp4_mmac.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_runtime.h>
@@ -105,6 +108,8 @@ const Fp4DeviceInfo& get_fp4_device_info() {
             info.logical_sms = 144;
         } else if (arch.rfind("gfx928", 0) == 0 && cus == 120) {
             info.logical_sms = 240;
+        } else if (arch.rfind("gfx946", 0) == 0 && cus > 0) {
+            info.logical_sms = cus;
         } else {
             TORCH_CHECK(false, "unsupported device config: ", arch,
                         ", CU=", cus);
@@ -325,7 +330,7 @@ __device__ __forceinline__ intx2 fp4_to_fp8(unsigned packed, int delta) {
 }
 
 __device__ __forceinline__ floatx4 mmac_bf16(bf16x4 a, bf16x4 b, floatx4 c) {
-#if defined(__gfx938__)
+#if defined(__gfx938__) || defined(__gfx946__)
     return __builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts(a, b, c, false, false);
 #elif defined(__gfx936__) || defined(__gfx928__)
     return __builtin_amdgcn_mmac_f32_16x16x16bf16(a, b, c);
@@ -352,7 +357,12 @@ __device__ __forceinline__ int wave_min(int x) {
 template<int H>
 struct RowQ {
     static constexpr int HT = H / 16;
+#if defined(__gfx946__)
+    uintx4 bits[HT];
+    unsigned sf[HT];
+#else
     bf16x4 bf[HT][8];
+#endif
     float w[HT][4];
     // The row's smallest and largest Q scale, which bound the BF16 subnormal shift.
     int smin, smax;
@@ -380,8 +390,13 @@ struct RowQ {
         }
 #pragma unroll
         for (int h = 0; h < HT; ++h) {
+#if defined(__gfx946__)
+            bits[h] = qb[h];
+            sf[h] = sq[h];
+#else
 #pragma unroll
             for (int k = 0; k < 8; ++k) bf[h][k] = decode_fp4x4((qb[h][k / 2] >> ((k & 1) * 16)) & 0xffffu, sq[h]);
+#endif
         }
         smax = 0;
         smin = 255;
@@ -517,7 +532,22 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H>* q, int
             const int kmin = min(min(s0, s1), min(s2, s3));
             shift = max(0, min(need - kmin, min(252 - kmax, 368 - qmax - kmax)));
         }
+#if defined(__gfx946__)
+        // A full-wave vote keeps MMAC converged, including partial KV tiles.
+        bool native_fp4[Rows];
+        bool need_bf16 = false;
+#pragma unroll
+        for (int i = 0; i < Rows; ++i) {
+            const int native_kmin = wave_min(t < visible[i] ? sk : 255);
+            const int native_kmax = wave_max(t < visible[i] ? sk : 0);
+            native_fp4[i] = q[i].smin >= 16 && q[i].smax <= 240 &&
+                native_kmin >= 16 && native_kmax <= 240 &&
+                q[i].smin + native_kmin >= 150 && q[i].smax + native_kmax <= 350;
+            if (start < visible[i]) need_bf16 |= !native_fp4[i];
+        }
+#else
         bool need_bf16 = true;
+#endif
 #if defined(__gfx938__)
         const int s0 = sw[tile] & 255u, s1 = (sw[tile] >> 8) & 255u;
         const int s2 = (sw[tile] >> 16) & 255u, s3 = sw[tile] >> 24;
@@ -561,6 +591,15 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H>* q, int
 #pragma unroll
             for (int h = 0; h < HT; ++h) acc[h] = floatx4{0.0f, 0.0f, 0.0f, 0.0f};
             float logit;
+#if defined(__gfx946__)
+            if (native_fp4[i]) {
+#pragma unroll
+                for (int h = 0; h < HT; ++h)
+                    acc[h] = fp4_detail::mmac_scaled_fp4(
+                        kb[tile], sk, q[i].bits[h], q[i].sf[h]);
+                logit = head_sum<HT>(acc, q[i].w);
+            } else
+#endif
 #if defined(__gfx938__)
             if (fp8[i]) {
 #pragma unroll
@@ -577,7 +616,15 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H>* q, int
 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
 #pragma unroll
-                    for (int h = 0; h < HT; ++h) acc[h] = mmac_bf16(kbf[k], q[i].bf[h][k], acc[h]);
+                    for (int h = 0; h < HT; ++h) {
+#if defined(__gfx946__)
+                        const bf16x4 qbf = decode_fp4x4(
+                            (q[i].bits[h][k / 2] >> ((k & 1) * 16)) & 0xffffu, q[i].sf[h]);
+#else
+                        const bf16x4 qbf = q[i].bf[h][k];
+#endif
+                        acc[h] = mmac_bf16(kbf[k], qbf, acc[h]);
+                    }
                 }
                 logit = head_sum<HT>(acc, q[i].w);
                 if constexpr (Shift) logit = ldexpf(logit, -shift);

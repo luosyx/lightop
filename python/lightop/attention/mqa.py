@@ -157,14 +157,15 @@ def paged_mqa_logits_fp4(q, q_sf, kv_cache, weights, context_lens, block_table,
     Columns at or past context_lens[b] are left unwritten. Returns FP32
     [B,max_context_len] with a row stride rounded up to the split size, so
     callers must respect stride(0). schedule_meta comes from
-    get_paged_mqa_logits_metadata(context_lens, 64, CUs) and may be None.
+    get_paged_mqa_logits_fp4_metadata(context_lens, 64, CUs, rows_per_request)
+    and may be None. gfx946 uses native FP4 MMAC for normal block scales.
 
     rows_per_request n > 1 (table_block_size 64, H <= 32 only) declares every
     n rows one request's draft tokens sharing the block table row of the
     first; with at least PAGED_MQA_LOGITS_FP4_PAIR_MIN_REQUESTS requests the
     rows are then scored in pairs, one KV read per pair, and fewer run as
-    n = 1. Results are identical either way. A schedule must be planned on
-    paged_mqa_logits_route_lens(context_lens, n) instead of context_lens.
+    n = 1. Pass the same n to get_paged_mqa_logits_fp4_metadata so its schedule
+    uses the matching route lengths.
     """
     from .. import op
     if not hasattr(op, "paged_mqa_logits_fp4"):

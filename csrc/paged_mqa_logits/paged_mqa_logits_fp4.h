@@ -24,8 +24,8 @@ inline constexpr int64_t kPagedMqaLogitsFp4MaxScheduleRows = 16384;
 /// \param weights [B,H] FP32 head weights
 /// \param context_lens [B] int32 visible positions per row
 /// \param block_table [B,blocks] int32 at table_block_size (64 dense, 8 candidate)
-/// \param schedule_meta get_paged_mqa_logits_metadata(lens, 64, cus), or none; lens are
-///        context_lens, or with rows_per_request > 1 the route lengths (see below)
+/// \param schedule_meta get_paged_mqa_logits_fp4_metadata(context_lens, 64, cus,
+///        rows_per_request), or none
 /// \param max_context_len logits width; the row stride is rounded up to the split size
 /// \param table_block_size positions per block_table entry, 8 or 64
 /// \param out optional preallocated FP32 [B,>=max_context_len] with contiguous columns
@@ -33,8 +33,7 @@ inline constexpr int64_t kPagedMqaLogitsFp4MaxScheduleRows = 16384;
 ///        sharing block_table row b n (table_block_size 64 and H <= 32 only). With at
 ///        least kPagedMqaLogitsFp4PairMinRequests requests the kernel scores routes of
 ///        rows (b n + 2 j, b n + 2 j + 1), j < ceil(n / 2), in one KV pass each; fewer
-///        run as n = 1. Logits are identical either way; the schedule is planned on
-///        paged_mqa_logits_route_lens, which applies the same threshold
+///        run as n = 1. The FP4 metadata planner applies the same pairing threshold
 /// \return FP32 [B,max_context_len]; columns at or past context_lens[b] are unwritten
 torch::Tensor paged_mqa_logits_fp4(
     const torch::Tensor& q, const torch::Tensor& q_sf, const torch::Tensor& kv_cache,
