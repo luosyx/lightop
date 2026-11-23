@@ -106,7 +106,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
 #endif
 
 namespace {
-#if !defined(LIGHTOP_PREFILL_FUSION_ONLY)
+#if defined(LIGHTOP_SPARSE_MQA_ONLY)
 void bind_paged_sparse_mqa(pybind11::module_& m) {
   namespace py = pybind11;
 #ifdef PREFILL_SPARSE_MQA_BUILD_ID
@@ -145,7 +145,7 @@ void bind_paged_sparse_mqa(pybind11::module_& m) {
 }
 #endif
 
-#if !defined(LIGHTOP_SPARSE_MQA_ONLY)
+#if defined(LIGHTOP_PREFILL_FUSION_ONLY)
 void bind_prefill_sparse_fusion(pybind11::module_& m) {
 #ifdef PREFILL_FUSION_BUILD_ID
   m.attr("PREFILL_SPARSE_FUSION_BUILD_ID") = PREFILL_FUSION_BUILD_ID;
@@ -449,80 +449,8 @@ Tensor m_grouped_marlin_fp8_gemm_nt_masked_asm(Tensor input, Tensor b_qweight, T
 Tensor m_grouped_bf16_gemm_nt_masked_asm(Tensor input, Tensor b_qweight, Tensor output, Tensor masked_m, int expected_m_per_group, int mode);
 Tensor moe_w16a16_asm(Tensor input,Tensor b_qweight,Tensor output,std::optional<Tensor> topk_weights,Tensor sorted_token_ids,Tensor expert_ids,Tensor num_tokens_post_pad, int top_k, int mode, int delta);
 Tensor moe_marlin_w16a16_asm(Tensor input,Tensor b_qweight,Tensor output,std::optional<Tensor> topk_weights,Tensor sorted_token_ids,Tensor expert_ids,Tensor num_tokens_post_pad, int top_k, int mode, int delta);
-Tensor moe_marlin_w4a16(torch::Tensor& a,
-                        std::optional<torch::Tensor> const& c_or_none,
-                        torch::Tensor& b_q_weight,
-                        torch::Tensor& b_scale_zeros,
-                        std::optional<torch::Tensor> const& g_idx_or_none,
-                        std::optional<torch::Tensor> const& perm_or_none,
-                        torch::Tensor& workspace,
-                        torch::Tensor& sorted_token_ids,
-                        torch::Tensor& expert_ids,
-                        torch::Tensor& num_tokens_past_padded,
-                        torch::Tensor& topk_weights,
-                        int64_t moe_block_size,
-                        int64_t top_k,
-                        bool mul_topk_weights,
-                        bool is_ep,
-                        int64_t size_m,
-                        int64_t size_n,
-                        int64_t size_k,
-                        bool is_k_full,
-                        bool use_atomic_add,
-                        bool use_fp32_reduce,
-                        bool is_zp_float,
-                        int64_t thread_n=-1, 
-                        int64_t thread_k=-1,
-                        int64_t blocks_per_cu=1
-                        );
-Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
-Tensor moe_marlin_w4a8(
-                        torch::Tensor& a_q,
-                        torch::Tensor& a_scales,
-                        torch::Tensor& c,
-                        torch::Tensor& b_q_weight,
-                        torch::Tensor& b_scales,
-                        torch::Tensor& workspace,
-                        torch::Tensor& global_reduce_buffer,  // 用于全局规约的缓冲区
-                        torch::Tensor& sorted_token_ids,
-                        torch::Tensor& expert_ids,
-                        torch::Tensor& num_tokens_past_padded,
-                        std::optional<torch::Tensor> topk_weights,
-                        int64_t moe_block_size,
-                        int64_t top_k,
-                        bool is_ep,
-                        int64_t size_m,
-                        int64_t size_n,
-                        int64_t size_k,
-                        int64_t thread_n,
-                        int64_t thread_k,
-                        int64_t blocks_per_cu,
-                        bool is_reduce
-                        );
-Tensor moe_marlin_w4fp8(
-                        torch::Tensor& a_q, 
-                        torch::Tensor& a_scales, 
-                        torch::Tensor& c,
-                        torch::Tensor& b_q_weight, 
-                        torch::Tensor& b_scales,
-                        torch::Tensor& workspace, 
-                        torch::Tensor& global_reduce_buffer,  // 用于全局规约的缓冲区
-                        torch::Tensor& sorted_token_ids, 
-                        torch::Tensor& expert_ids,
-                        torch::Tensor& num_tokens_past_padded, 
-                        std::optional<torch::Tensor> topk_weights,
-                        int64_t moe_block_size, 
-                        int64_t top_k, 
-                        bool is_ep,
-                        int64_t size_m, 
-                        int64_t size_n,
-                        int64_t size_k,
-                        int64_t thread_n,
-                        int64_t thread_k,
-                        int64_t blocks_per_cu,
-                        bool is_reduce
-                        );
-Tensor awq_marlin_repack_w4a8(torch::Tensor& b_q_weight, torch::Tensor& marlin_weight, int64_t size_batch, int64_t size_k, int64_t size_n);
+// moe_marlin_w4a16, awq_marlin_repack, moe_marlin_w4a8, awq_marlin_repack_w4a8,
+// and moe_marlin_w4fp8 moved to module_marlin_w4a16 / module_marlin_w4a8 / module_marlin_w4fp8.
 Tensor ds_concat(torch::Tensor input_A, torch::Tensor input_B, torch::Tensor output, int32_t mode);
 void blockwise_scaled_cast_transpose(const Tensor& input,std::optional<Tensor> output,std::optional<Tensor> scale_inv,
                                     std::optional<Tensor> output_t,std::optional<Tensor> scale_inv_t,std::optional<Tensor> noop,
@@ -1246,95 +1174,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &lightop_int8_blaslt::scaled_mm,
         py::arg("input"), py::arg("weight"), py::arg("scale_input"),
         py::arg("scale_weight"), py::arg("solution"));
-  m.def("layernorm_forward_autograd", &at::native::fuse_layernorm_forward_autograd, "layernorm forward");
-  m.def("layernorm_mixed_fp32_params_forward_autograd", &at::native::fuse_layernorm_mixed_fp32_params_autograd,
-        "layernorm forward, activations half/bf16 and weight/bias float32");
-  m.def("add_ln_forward_autograd", &at::native::fuse_add_ln_forward_autograd, "layernorm forward");
-  m.def("ln_dropout_forward_autograd", &at::native::fuse_ln_dropout_forward_autograd, "fused_ln_dropout forward");
-  m.def("ln_add_dropout_forward_autograd", &at::native::fuse_ln_add_dropout_forward_autograd, "fused_ln_add_dropout forward");
-  m.def("ln_add_dropout_bias_forward_autograd", &at::native::fuse_ln_add_dropout_bias_forward_autograd, "fused_ln_add_dropout_bias forward");
-  m.def("layernorm_droppath_forward_autograd", &at::native::fuse_layernorm_droppath_forward_autograd, "layernorm then droppath forward");
-  m.def("rmsnorm_forward_autograd", &at::native::rmsnorm_forward_autograd, "rmsnorm forward autograd");
-  m.def("rmsnorm_forward", &at::native::rmsnorm_forward, "rmsnorm forward");
-  m.def("rmsnorm_backward", &at::native::rmsnorm_backward, "rmsnorm backward");
-  m.def("fused_rms_norm_contiguous", &at::native::fused_rms_norm_contiguous, "fused_rms_norm_contiguous");
-  m.attr("MLA_ROPE_SUPPORTED_Q_HEAD_STRIDES") = py::make_tuple(192, 256);
-  m.def(
-      "fused_rms_norm_rope_contiguous",
-      &at::native::fused_rms_norm_rope_contiguous,
-      "fused_rms_norm_rope_contiguous",
-      py::arg("positions"),
-      py::arg("q_pe"),
-      py::arg("k_pe"),
-      py::arg("kv_c"),
-      py::arg("kv_c_normed"),
-      py::arg("weight"),
-      py::arg("cos_sin_cache"),
-      py::arg("slot_mapping"),
-      py::arg("kv_cache"),
-      py::arg("kv_cache_dtype_str"),
-      py::arg("kv_cache_scale"),
-      py::arg("is_neox_style"),
-      py::arg("epsilon"),
-      py::arg("limit") = -1.0,
-      py::arg("flashmla_fp8_layout") = false,
-      py::arg("kv_quant_epsilon") = 1e-6f,
-      py::arg("kv_smooth_scale") = py::none());
-  m.def(
-      "fused_rms_norm_rope_contiguous_q_cat",
-      &at::native::fused_rms_norm_rope_contiguous_q_cat,
-      "fused_rms_norm_rope_contiguous_q_cat",
-      py::arg("positions"),
-      py::arg("q_pe"),
-      py::arg("k_pe"),
-      py::arg("kv_c"),
-      py::arg("kv_c_normed"),
-      py::arg("weight"),
-      py::arg("cos_sin_cache"),
-      py::arg("slot_mapping"),
-      py::arg("kv_cache"),
-      py::arg("q_nope"),
-      py::arg("q_cat"),
-      py::arg("kv_cache_dtype_str"),
-      py::arg("kv_cache_scale"),
-      py::arg("is_neox_style"),
-      py::arg("epsilon"),
-      py::arg("limit") = -1.0,
-      py::arg("flashmla_fp8_layout") = false,
-      py::arg("kv_quant_epsilon") = 1e-6f,
-      py::arg("kv_smooth_scale") = py::none());
-  m.def(
-      "fuse_rmsnorm_rope_quant_qkv",
-      &at::native::fuse_rmsnorm_rope_quant_qkv,
-      "fuse_rmsnorm_rope_quant_qkv",
-      py::arg("positions"),
-      py::arg("q_c"),
-      py::arg("q_pe"),
-      py::arg("q_quant"),
-      py::arg("q_scale"),
-      py::arg("k_pe"),
-      py::arg("kv_c"),
-      py::arg("kv_c_normed"),
-      py::arg("weight"),
-      py::arg("cos_sin_cache"),
-      py::arg("slot_mapping"),
-      py::arg("kv_cache"),
-      py::arg("kv_cache_dtype_str"),
-      py::arg("kv_cache_scale"),
-      py::arg("is_neox_style"),
-      py::arg("epsilon"),
-      py::arg("limit") = -1.0);
+
+
+
+
+
+
+
+
   m.def("grid_sample_forward_autograd", &at::native::grid_sample_forward_autograd, "grid_sample forward autograd");
   m.def("grid_sample_forward", &at::native::grid_sample_forward, "grid_sample forward");
   m.def("grid_sample_backward", &at::native::grid_sample_backward, "grid_sample backward");
-  m.def("gammarms_rotary_embedding_fuse_with_kv_store", &at::native::gammarms_rotary_embedding_fuse_with_kv_store, "gammarms_rotary_embedding_fuse_with_kv_store");
-  m.def("rms_rotary_embedding_fuse_with_kv_store", &at::native::rms_rotary_embedding_fuse_with_kv_store, "rms_rotary_embedding_fuse_with_kv_store");
-  m.def("split_qkv_rms_rotary_embedding_fuse_with_kv_store_no_quant", &at::native::split_qkv_rms_rotary_embedding_fuse_with_kv_store_no_quant, "split_qkv_rms_rotary_embedding_fuse_with_kv_store_no_quant");
-  m.def("fuse_fill_rms_x2_concat", &at::native::fuse_fill_rms_x2_concat, "fuse_fill_rms_x2_concat");
-  m.def("rn_dropout_forward_autograd", &at::native::fuse_rn_dropout_forward_autograd, "fused_rn_dropout forward");
-  m.def("rn_add_forward_autograd", &at::native::fuse_rn_add_forward_autograd, "fused_rn_add forward");
-  m.def("rn_add_dropout_forward_autograd", &at::native::fuse_rn_add_dropout_forward_autograd, "fused_rn_add_dropout forward");
-  m.def("rn_add_dropout_bias_forward_autograd", &at::native::fuse_rn_add_dropout_bias_forward_autograd, "fused_rn_add_dropout_bias forward");
+
+
+
+
+
+
+
+
   m.def("droppath_forward_autograd",&at::native::drop_path_forward_autograd,"droppath forward") ;
   m.def("add_dropout_forward_autograd", &at::native::fuse_add_dropout_forward_autograd, "fused_dropout forward");
   m.def("fused_linear_bias_forward_autograd", &at::native::fused_linear_bias_forward_autograd, "fused_linearbias forward autograd");
@@ -1362,9 +1220,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_bmm", &at::native::fused_bmm, "fused transepose bmm transpose");
   m.def("bias_dropout_add_forward", &at::native::fuse_bias_dropout_add_forward, "fuse_bias_dropout_add forward");
   m.def("bias_dropout_add_backward", &at::native::fuse_bias_dropout_add_backward, "fuse_bias_dropout_add backward");
-  m.def("groupnorm_forward_autograd", &at::native::fuse_groupnorm_forward_autograd, "groupnorm forward");
-  m.def("celu_gn_forward_autograd", &at::native::fuse_celu_gn_forward_autograd, "celu_gn forward");
-  m.def("gn_silu_forward_autograd", &at::native::fuse_gn_silu_forward_autograd, "gn_silu forward");
   m.def("sum_opt", &at::native::sum_opt, "sum_opt");
   m.def("mean_opt", &at::native::mean_opt, "mean_opt");
   m.def("topk_opt", &at::native::topk_opt, "topk_opt");
@@ -1383,11 +1238,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("m_grouped_w8a8_gemm_nt_contig_asm", &at::native::m_grouped_w8a8_gemm_nt_contig_asm, "m_grouped_w8a8_gemm_nt_contig_asm");
   m.def("m_grouped_w16a16_gemm_nt_contig_asm",&at::native::m_grouped_w16a16_gemm_nt_contig_asm,"m_grouped_w16a16_gemm_nt_contig_asm");
   m.def("m_grouped_w8a8_gemm_nt_nopad_contig_asm",&at::native::m_grouped_w8a8_gemm_nt_nopad_contig_asm,"m_grouped_w8a8_gemm_nt_nopad_contig_asm");
-  m.def("moe_gemm_w8a8", &at::native::moe_gemm_w8a8, "moe_gemm_w8a8");
-  m.def("moe_gemm_marlin_w8a8", &at::native::moe_gemm_marlin_w8a8, "moe_gemm_marlin_w8a8");
-  m.def("moe_gemm_marlin_w8a8_fp8", &at::native::moe_gemm_marlin_w8a8_fp8, "moe_gemm_marlin_w8a8_fp8");
-  m.def("moe_gemm_marlin_w8a8_blockwise_fp8", &at::native::moe_gemm_marlin_w8a8_blockwise_fp8, "moe_gemm_marlin_w8a8_blockwise_fp8");
-  m.def("moe_gemm_w4a8", &at::native::moe_gemm_w4a8, "moe_gemm_w4a8");
   m.def("gemm_w8_a8_smooth_colmajor", &at::native::gemm_w8_a8_smooth_colmajor, "gemm_w8_a8_smooth_colmajor");
   m.def("gemm_w8a8_smooth_asm", &at::native::gemm_w8a8_smooth_asm, "gemm_w8a8_smooth_asm",
         py::arg("A"), py::arg("B"), py::arg("As"), py::arg("Bs"), py::arg("bias"),
@@ -1407,55 +1257,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_marlin_w8a8_fp8_asm", &at::native::moe_marlin_w8a8_fp8_asm, "moe_marlin_w8a8_fp8_asm");
   m.def("moe_w4a8_asm", &at::native::moe_w4a8_asm, "moe_w4a8_asm");
   m.def("moe_w4a8_marlin_asm", &at::native::moe_w4a8_marlin_asm, "moe_w4a8_marlin_asm");
-  m.def("moe_gemm_w16a16", &at::native::moe_gemm_w16a16, "moe_gemm_w16a16");
   m.def("moe_groupgemm_w4a8_asm", &at::native::moe_groupgemm_w4a8_asm, "moe_groupgemm_w4a8_asm");
   m.def("moe_groupgemm_marlin_w4a8_asm", &at::native::moe_groupgemm_marlin_w4a8_asm, "moe_groupgemm_marlin_w4a8_asm");
   m.def("m_grouped_marlin_w4a8_gemm_nt_masked_asm", &at::native::m_grouped_marlin_w4a8_gemm_nt_masked_asm, "m_grouped_marlin_w4a8_gemm_nt_masked_asm");
   m.def("m_grouped_marlin_w8a8_gemm_nt_masked_asm", &at::native::m_grouped_marlin_w8a8_gemm_nt_masked_asm, "m_grouped_marlin_w8a8_gemm_nt_masked_asm");
   m.def("m_grouped_marlin_fp8_gemm_nt_masked_asm", &at::native::m_grouped_marlin_fp8_gemm_nt_masked_asm, "m_grouped_marlin_fp8_gemm_nt_masked_asm");
   m.def("m_grouped_bf16_gemm_nt_masked_asm", &at::native::m_grouped_bf16_gemm_nt_masked_asm, "m_grouped_bf16_gemm_nt_masked_asm");
-  m.def("moe_marlin_w4a16", &at::native::moe_marlin_w4a16, "moe_marlin_w4a16");
-  m.def("moe_marlin_w4a8", &at::native::moe_marlin_w4a8, "moe_marlin_w4a8");
-  m.def("moe_marlin_w4fp8", &at::native::moe_marlin_w4fp8, "moe_marlin_w4fp8");
-  m.def("awq_marlin_repack", &at::native::awq_marlin_repack, "awq_marlin_repack");
-  m.def("awq_marlin_repack_w4a8", &at::native::awq_marlin_repack_w4a8, "awq_marlin_repack_w4a8");
+  // Marlin MoE ops moved to module_marlin_w4a16 / module_marlin_w4a8 / module_marlin_w4fp8.
   m.def("blockwise_scaled_cast_transpose", &at::native::blockwise_scaled_cast_transpose, "blockwise_scaled_cast_transpose");
-  m.def(
-      "rms_norm_dynamic_per_token_quant",
-      &at::native::rms_norm_dynamic_per_token_quant,
-      "rms_norm_dynamic_per_token_quant",
-      py::arg("output"),
-      py::arg("input"),
-      py::arg("weight"),
-      py::arg("scales"),
-      py::arg("epsilon"),
-      py::arg("residual"),
-      py::arg("update_input"),
-      py::arg("limit") = -1.0);
-  m.def(
-      "rms_norm_dynamic_per_token_quant_sglang",
-      &at::native::rms_norm_dynamic_per_token_quant_sglang,
-      "rms_norm_dynamic_per_token_quant_sglang",
-      py::arg("output"),
-      py::arg("input"),
-      py::arg("weight"),
-      py::arg("scales"),
-      py::arg("epsilon"),
-      py::arg("residual") = py::none(),
-      py::arg("update_input") = true,
-      py::arg("limit") = -1.0,
-      py::arg("smooth_scale") = py::none(),
-      py::arg("norm_output") = py::none(),
-      py::arg("clamp_norm_output") = true,
-      py::arg("residual_output") = py::none(),
-      py::arg("clamped_output") = py::none());
-  m.def("mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang",&at::native::mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang,
-        "mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang");
-  m.def("rms_norm_fp8_quant", &at::native::rms_norm_fp8_quant,
-        py::arg("out"), py::arg("input"), py::arg("weight"), py::arg("scales"),
-        py::arg("epsilon"), py::arg("residual"), py::arg("update_input"),
-        py::arg("fp8type"), py::arg("norm_output") = py::none());
-  m.attr("RMS_NORM_FP8_QUANT_VERSION") = 2;
+
+
+
+
+
   m.def("rotary_embedding_fuse", &at::native::rotary_embedding_fuse, "rotary_embedding_fuse",py::arg("positions"),py::arg("query"),py::arg("key"),py::arg("head_size"),py::arg("cos_sin_cache"),py::arg("is_neox"));
   m.attr("ROTARY_EMBEDDING_BF16_ROUNDED_OUT_ABI") = 2;
   m.def("rotary_embedding_deepseek_fuse",
@@ -1467,34 +1281,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("round_bf16_products") = false,
         py::arg("query_out") = py::none(), py::arg("key_out") = py::none());
   m.def("groupgemm",&at::native::groupgemm,"groupgemm");
-  m.def("groupgemm_permute",&at::native::groupgemm_permute,"groupgemm_permute");
-  m.def("groupgemm_unpermute",&at::native::groupgemm_unpermute,"groupgemm_unpermute");
   m.def("fuse_groupgemm_permute_quant",&at::native::fuse_groupgemm_permute_quant,"fuse_groupgemm_permute_quant");
-  m.def(
-      "moe_fused_gate",
-      &at::native::moe_fused_gate,
-      "moe_fused_gate",
-      py::arg("input"),
-      py::arg("bias"),
-      py::arg("num_expert_group"),
-      py::arg("topk_group"),
-      py::arg("topk"),
-      py::arg("n_share_experts_fusion"),
-      py::arg("routed_scaling_factor"),
-      py::arg("apply_routed_scaling_factor_on_output") = true,
-      py::arg("output_indices_int64") = false);
-  m.def(
-      "moe_fuse_gate_per_gourp_topk",
-      &at::native::moe_fuse_gate_per_gourp_topk,
-      "SparkV1 per-group top-k fused MoE gate",
-      py::arg("input"),
-      py::arg("bias"),
-      py::arg("num_expert_group"),
-      py::arg("topk_per_group"),
-      py::arg("num_pad_experts"),
-      py::arg("num_shared_experts"),
-      py::arg("routed_scaling_factor"),
-      py::arg("apply_routed_scaling_factor_on_output") = true);
   m.def("fuse_silu_mul_quant",&at::native::fuse_silu_mul_quant,"fuse_silu_mul_quant");
   m.attr("SILU_CLAMP_QUANT_ROUNDING_VERSION") = 2;
   m.def(
@@ -1547,109 +1334,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ds_concat",&at::native::ds_concat,"ds_concat");
   m.def("ms_deform_attn_forward", &at::native::ms_deform_attn_cuda_forward,"ms_deform_attn_forward");
   m.def("ms_deform_attn_backward", &at::native::ms_deform_attn_cuda_backward,"ms_deform_attn_backward");
-  m.def("moe_sum", &at::native::moe_sum, "moe_sum",
-      py::arg("input"),
-      py::arg("output"),
-      py::arg("bias")  =   torch::nullopt ,
-      py::arg("expert_mask") =   torch::nullopt,
-      py::arg("num_local_tokens") =   torch::nullopt,
-      py::arg("factor") = 1.0f,
-      py::arg("expect_m") = -1
-  );
-  m.def("moe_align_block_size", &at::native::moe_align_block_size, "moe_align_block_size",
-      py::arg("topk_ids"),
-      py::arg("num_experts"),
-      py::arg("block_size"),
-      py::arg("sorted_token_ids"),
-      py::arg("experts_ids"),
-      py::arg("num_tokens_post_pad"),
-      py::arg("expert_map") =   torch::nullopt,
-      py::arg("expert_mask") =   torch::nullopt,
-      py::arg("num_local_tokens") =   torch::nullopt,
-      py::arg("Is_EP") = false,
-      py::arg("Is_fuse_fill") = true
-  );
   m.def("mha_norm_rope_qkv_inplace_cuda", &at::native::mha_norm_rope_qkv_inplace_cuda,"mha_norm_rope_qkv_inplace_cuda");
   m.def("cross_norm_rope_q_kv_inplace_cuda", &at::native::cross_norm_rope_q_kv_inplace_cuda,"cross_norm_rope_q_kv_inplace_cuda");
   m.def("box_cost", &at::native::box_cost, "box_cost");
   m.def("encode_reg_t", &at::native::encode_reg_t, "encode_reg_t");
-  m.def("mqa_logits", &at::native::mqa_logits, "mqa_logits",
-      py::arg("Q"),
-      py::arg("K"),
-      py::arg("Weights"),
-      py::arg("KS"),
-      py::arg("KE"),
-      py::arg("seq_len"),
-      py::arg("kv_seq_len"),
-      py::arg("num_heads"),
-      py::arg("head_dim"),
-      py::arg("KV_scale") = torch::nullopt, 
-      py::arg("clean_logits") = true,
-      py::arg("D_out") = torch::nullopt);
-  m.def("mqa_logits_topk_sampled_int8", &lightop::mqa_int8::mqa_logits_topk_sampled_int8,
-      py::arg("q"),
-      py::arg("k"),
-      py::arg("weights"),
-      py::arg("kv_scale"),
-      py::arg("starts"),
-      py::arg("ends"),
-      py::arg("offsets"),
-      py::arg("sorted_values") = py::none(),
-      py::arg("next_thresholds") = py::none(),
-      py::arg("stats") = py::none(),
-      py::arg("parallel_histogram") = true,
-      py::arg("fallback_workspace_rows") = 0,
-      py::arg("reuse_full_window") = true,
-      py::arg("sort_topk") = true,
-      py::arg("min_sample_k") = 131072,
-      py::arg("direct_candidate_emit") = false);
-  m.def("get_paged_mqa_logits_metadata", &lightop::deep_gemm::get_paged_mqa_logits_metadata,"get_paged_mqa_logits_metadata");
-  m.def("dsv41_mqa_query_lens", &lightop::fp4_mqa::dsv41_mqa_query_lens,
-        py::arg("extend_start_loc"), py::arg("extend_seq_lens"),
-        py::arg("cp_size"), py::arg("cp_rank"));
-  m.def("dsv41_mqa_prefill_metadata", &lightop::fp4_mqa::dsv41_mqa_prefill_metadata,
-        py::arg("seq_lens"), py::arg("q_lens"), py::arg("positions"),
-        py::arg("req_pool_indices"), py::arg("req_to_token"), py::arg("ratio"),
-        py::arg("num_k_slots"), py::arg("max_request_work"));
-  m.def("dsv41_gather_index_k_fp4", &lightop::fp4_mqa::dsv41_gather_index_k_fp4,
-        py::arg("cache"), py::arg("slots"), py::arg("page_size"));
-  m.def("fp8_fp4_mqa_logits", &lightop::fp4_mqa::fp8_fp4_mqa_logits,
-        py::arg("q"), py::arg("kv"), py::arg("weights"),
-        py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
-        py::arg("clean_logits"), py::arg("max_seqlen_k"),
-        py::arg("candidate_blocks") = std::nullopt,
-        py::arg("candidate_query_lens") = std::nullopt);
-  m.attr("_fp8_fp4_mqa_logits_supports_candidates") = true;
-  m.def("paged_mqa_logits", &lightop::deep_gemm::paged_mqa_logits,"paged_mqa_logits");
-  m.def("paged_mqa_logits_persisten", &lightop::deep_gemm::paged_mqa_logits_persisten,
-        "dense persistent paged MQA logits with per-request KV reuse",
-        py::arg("q"), py::arg("fused_kv_cache"), py::arg("weights"),
-        py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-        py::arg("max_context_len"), py::arg("clean_logits") = true,
-        py::arg("num_warps") = 4, py::arg("persistent_ctas") = 0,
-        py::arg("group_size") = 1);
-  m.def("paged_mqa_logits_fp4", &lightop::deep_gemm::paged_mqa_logits_fp4,
-        "DeepGEMM fp8_fp4_paged_mqa_logits (clean_logits=False) on the fused FP4 index-K pool",
-        py::arg("q"), py::arg("q_sf"), py::arg("kv_cache"), py::arg("weights"),
-        py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-        py::arg("max_context_len"), py::arg("table_block_size") = 64,
-        py::arg("out") = std::nullopt, py::arg("rows_per_request") = 1);
-  m.attr("PAGED_MQA_LOGITS_FP4_PAIR_MIN_REQUESTS") = lightop::deep_gemm::kPagedMqaLogitsFp4PairMinRequests;
-  m.attr("PAGED_MQA_LOGITS_FP4_MAX_SCHEDULE_ROWS") = lightop::deep_gemm::kPagedMqaLogitsFp4MaxScheduleRows;
-  m.def("get_paged_mqa_logits_fp4_metadata",
-        &lightop::deep_gemm::get_paged_mqa_logits_fp4_metadata,
-        "FP4 paged MQA split-KV schedule planner",
-        py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
-        py::arg("rows_per_request") = 1);
-  bind_paged_sparse_mqa(m);
-  m.def("dsv41_candidate_block_table", &lightop::deep_gemm::dsv41_candidate_block_table,
-        "DSV4.1 candidate indexer level one: top blocks of 8 by block max as pool slots / 8",
-        py::arg("logits"), py::arg("seq_lens"), py::arg("page_table"), py::arg("page_size"),
-        py::arg("block_size"), py::arg("out_phys_blocks"), py::arg("out_valid_lens"));
-  m.def("dsv41_select_candidate_blocks", &lightop::deep_gemm::dsv41_select_candidate_blocks,
-        "DSV4.1 candidate block selection and dense mask expansion",
-        py::arg("logits"), py::arg("seq_lens"), py::arg("block_size"),
-        py::arg("out_mask"), py::arg("out_block_ids"));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   m.def("dsv41_build_swa_token_ids", &lightop::dsv41::build_swa_token_ids,
         "SWA metadata prefix and physical token gather");
   m.def("dsv41_remap_indices_to_staging", &lightop::dsv41::remap_indices_to_staging,
@@ -1660,79 +1364,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "DSV4.1 pair-partner gather and ordered ring-state update",
         py::arg("kv"), py::arg("score"), py::arg("req"), py::arg("pos"),
         py::arg("pad"), py::arg("state"), py::arg("ring_size"));
-  m.def(
-      "dequantize_index_k_int8_paged",
-      &lightop::deep_gemm::dequantize_index_k_int8_paged,
-      "dequantize_index_k_int8_paged",
-      py::arg("packed_cache"),
-      py::arg("block_tables"),
-      py::arg("context_lens"),
-      py::arg("workspace"),
-      py::arg("page_claims"),
-      py::arg("waves_per_page") = 1);
-  m.def(
-      "page_mqa_logits_sparse_mask",
-      &lightop::deep_gemm::page_mqa_logits_sparse_mask,
-      "page_mqa_logits_sparse_mask",
-      py::arg("q"),
-      py::arg("fused_kv_cache"),
-      py::arg("weights"),
-      py::arg("context_lens"),
-      py::arg("block_table"),
-      py::arg("schedule_meta"),
-      py::arg("max_context_len"),
-      py::arg("clean_logits") = true,
-      py::arg("num_warps") = 4,
-      py::arg("persistent_ctas") = 0);
-  m.def(
-      "page_mqa_logits_sparse_mask_grouped",
-      &lightop::deep_gemm::page_mqa_logits_sparse_mask_grouped,
-      "page_mqa_logits_sparse_mask_grouped",
-      py::arg("q"),
-      py::arg("fused_kv_cache"),
-      py::arg("weights"),
-      py::arg("context_lens"),
-      py::arg("block_table"),
-      py::arg("schedule_meta"),
-      py::arg("max_context_len"),
-      py::arg("clean_logits") = true,
-      py::arg("num_warps") = 4,
-      py::arg("persistent_ctas") = 0,
-      py::arg("group_size") = 5);
-  m.def(
-      "page_mqa_logits_sparse_mask_grouped_int8",
-      &lightop::deep_gemm::page_mqa_logits_sparse_mask_grouped_int8,
-      "page_mqa_logits_sparse_mask_grouped_int8",
-      py::arg("q"),
-      py::arg("packed_kv_cache"),
-      py::arg("weights"),
-      py::arg("context_lens"),
-      py::arg("block_table"),
-      py::arg("schedule_meta"),
-      py::arg("max_context_len"),
-      py::arg("clean_logits") = true,
-      py::arg("num_warps") = 4,
-      py::arg("persistent_ctas") = 0,
-      py::arg("group_size") = 5);
+
+
+
+
   m.def("batch_linear_assignment", &at::native::batch_linear_assignment, "batch_linear_assignment");
   m.def("fill_zeros", &at::native::fill_zeros,"fill_zeros");
-  m.def("rms_rotary_embedding_fuse", &at::native::rms_rotary_embedding_fuse,"rms_rotary_embedding_fuse");
+
   m.def("reshape_and_cache_cuda", &at::native::reshape_and_cache_cuda,"reshape_and_cache_cuda");
-  m.def("ep_fused_quant_scatter", &at::native::ep_fused_quant_scatter,"ep_fused_quant_scatter");
-  m.def("ep_scatter", &at::native::ep_scatter,"ep_scatter");
   m.def("destindex_copy_quantize_int8_cuda", &at::native::destindex_copy_quantize_int8_cuda, "destindex_copy_quantize_int8_cuda");
   m.def("destindex_dequantize_int8_cuda", &at::native::destindex_dequantize_int8_cuda, "destindex_dequantize_int8_cuda");
-  m.def("kimi_k2_moe_fused_gate", &at::native::kimi_k2_moe_fused_gate, "kimi_k2_moe_fused_gate");
-  m.def("fuse_rms_mrope_cuda", &at::native::fuse_rms_mrope_cuda,"fuse_rms_mrope_cuda");
-  m.def("ep_gather", &at::native::ep_gather, "ep_gather",
-        py::arg("a"), py::arg("topk_ids"), py::arg("topk_weights"),
-        py::arg("inv_perm"), py::arg("expert_map"), py::arg("output"),
-        py::arg("specialize_k8") = false);
+
   m.def("backward_polyfill_cuda", &at::native::backward_polyfill_cuda, "backward_polyfill_cuda");
   m.def("forward_polyfill_cuda", &at::native::forward_polyfill_cuda, "forward_polyfill_cuda");
   m.def("forward_polyfill_lightop", &at::native::forward_polyfill_lightop, "forward_polyfill_lightop");
   m.def("backward_polyfill_lightop", &at::native::backward_polyfill_lightop, "backward_polyfill_lightop");
-  m.def("ep_fused_smooth_quant_scatter", &at::native::ep_fused_smooth_quant_scatter, "ep_fused_smooth_quant_scatter");
   m.def(
       "per_token_dynamic_quant_int8",
       &at::native::per_token_dynamic_quant_int8,
@@ -1763,35 +1409,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("top_p_sampling_from_probs", &lightop::sampling::top_p_sampling_from_probs, "top_p_sampling_from_probs");
   m.def("top_k_top_p_sampling_from_probs", &lightop::sampling::top_k_top_p_sampling_from_probs, "top_k_top_p_sampling_from_probs");
   m.def("top_k_first_top_p_sampling_from_probs", &lightop::sampling::top_k_first_top_p_sampling_from_probs, "top_k_first_top_p_sampling_from_probs");
-  m.def(
-      "rms_norm_opt",
-      &at::native::rms_norm_opt,
-      "rms_norm_opt",
-      py::arg("out"),
-      py::arg("input"),
-      py::arg("weight"),
-      py::arg("epsilon"),
-      py::arg("limit") = -1.0);
-  m.def("rms_norm_no_weight", &at::native::rms_norm_no_weight, "rms_norm_no_weight");
-  m.def(
-      "fused_add_rms_norm_opt",
-      &at::native::fused_add_rms_norm_opt,
-      "fused_add_rms_norm_opt",
-      py::arg("input"),
-      py::arg("residual"),
-      py::arg("weight"),
-      py::arg("epsilon"),
-      py::arg("limit") = -1.0,
-      py::arg("use_aligned_loads") = false);
-  m.def(
-      "layer_norm_opt", &at::native::layer_norm_opt, "layer_norm_opt",
-      py::arg("out"), py::arg("input"), py::arg("weight"), py::arg("bias"),
-      py::arg("epsilon"), py::arg("limit") = -1.0);
-  m.def(
-      "fused_add_layer_norm_opt", &at::native::fused_add_layer_norm_opt,
-      "fused_add_layer_norm_opt", py::arg("input"), py::arg("residual"),
-      py::arg("weight"), py::arg("bias"), py::arg("epsilon"),
-      py::arg("limit") = -1.0);
+
+
+
   m.def("silu_and_mul_opt", &at::native::silu_and_mul_opt, "silu_and_mul_opt");
   m.def("gelu_and_mul_opt", &at::native::gelu_and_mul_opt, "gelu_and_mul_opt");
   m.def("gelu_tanh_and_mul_opt", &at::native::gelu_tanh_and_mul_opt, "gelu_tanh_and_mul_opt");
@@ -1828,12 +1448,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
      py::arg("kv_cache_dtype"),
      py::arg("scale"),
      py::arg("seq_starts") = py::none());
- m.def("fused_rms_norm_rope_int8quant_contiguous", &at::native::fused_rms_norm_rope_int8quant_contiguous, "fused_rms_norm_rope_int8quant_contiguous");    
+    
  m.def("per_token_quant_fp8", &at::native::per_token_quant_fp8,
        py::arg("out"), py::arg("input"), py::arg("scales"),
        py::arg("quant_ndim") = 1, py::arg("threads") = 256);
  m.attr("PER_TOKEN_QUANT_FP8_VERSION") = 2;
- m.def("rms_norm_smooth_per_token_dynamic_quant", &at::native::rms_norm_smooth_per_token_dynamic_quant, "rms_norm_smooth_per_token_dynamic_quant");   
+   
  m.def("swiglu_oai_build_gate_table", &at::native::swiglu_oai_build_gate_table);
  m.def("swiglu_oai_build_int8_quant_table", &at::native::swiglu_oai_build_int8_quant_table);
  m.def("swiglu_oai_int8_quant_contiguous_tables", &at::native::swiglu_oai_int8_quant_contiguous_tables);
@@ -1843,15 +1463,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
  m.def("swiglu_oai_int8_quant_contiguous", &at::native::swiglu_oai_int8_quant_contiguous, "BF16-rounded OAI row INT8 quantization");
  m.def("swiglu_oai_int8_quant_masked", &at::native::swiglu_oai_int8_quant_masked, "Masked BF16-rounded OAI row INT8 quantization with zero/unit padding");
  m.def("swiglu_oai_fp8_quant_contiguous", &at::native::swiglu_oai_fp8_quant_contiguous, "Contiguous BF16 OAI activation and per-token E4M3FN quantization", pybind11::arg("input"), pybind11::arg("alpha") = 1.702, pybind11::arg("beta") = 1.0, pybind11::arg("limit") = 7.0);
- m.def("moe_swiglu_dynamic_quant", &at::native::moe_swiglu_dynamic_quant, "moe_swiglu_dynamic_quant");  
+  
  m.def("per_token_group_quant_fp8", &at::native::per_token_group_quant_fp8, "per_token_group_quant_fp8");  
  m.def("top_k_per_row_prefill", &at::native::top_k_per_row_prefill, "top_k_per_row_prefill");  
  m.def("top_k_per_row_decode", &at::native::top_k_per_row_decode, "top_k_per_row_decode");  
  m.def("convert_req_index_to_global_index", &at::native::convert_req_index_to_global_index, "convert_req_index_to_global_index");
- m.def("fuse_qkv_head_rms_norm", &at::native::fuse_qkv_head_rms_norm, "fuse_qkv_head_rms_norm");
- m.def("gemma_fused_add_rmsnorm", &at::native::gemma_fused_add_rmsnorm, "gemma_fused_add_rmsnorm");
- m.def("gemma_rmsnorm", &at::native::gemma_rmsnorm, "gemma_rmsnorm");
- m.def("gemma_rms_norm_fp8_quant", &at::native::gemma_rms_norm_fp8_quant, "gemma_rms_norm_fp8_quant");
+
+
+
+
   m.def("fast_topk_transform_interface", &at::native::fast_topk_transform_interface,
         "transform length TopK indices into paged KVCache",
         py::arg("score"), py::arg("lengths"), py::arg("dst_page_table"),
@@ -1939,36 +1559,12 @@ m.def(
      "DPSKV4 fused dual-cache paged gather, BF16 upconvert, and compact indices");
  m.def("fuse_act_quant_and_store_index_k_cache", &at::native::fuse_act_quant_and_store_index_k_cache, "fuse_act_quant_and_store_index_k_cache");
  m.def("fuse_qk_quant_and_store_index_k_cache", &at::native::fuse_qk_quant_and_store_index_k_cache, "fuse_qk_quant_and_store_index_k_cache");
- m.def("fuse_layernorm_rotary_embedding", &at::native::fuse_layernorm_rotary_embedding, "fuse_layernorm_rotary_embedding");
- m.def("fuse_norm_rope_quant_fp8", &at::native::fuse_norm_rope_quant_fp8, "fuse_norm_rope_quant_fp8");
  m.def("fused_quantize_and_store_mla_kv_cache", &at::native::fused_quantize_and_store_mla_kv_cache, "fused_quantize_and_store_mla_kv_cache");
 m.def("fused_quantize_and_store_mla_kv_cache_dual", &at::native::fused_quantize_and_store_mla_kv_cache_dual, py::arg("k_nope"), py::arg("k_rope"), py::arg("kv_buffer"), py::arg("loc"), py::arg("mirror_buffer") = py::none(), py::arg("mirror_loc") = py::none(), py::arg("concat_out") = py::none(), py::arg("eps") = 1e-6f);
 m.def("main_kv_loc_to_compact", &at::native::main_kv_loc_to_compact, py::arg("loc"), py::arg("physical_to_compact"), py::arg("page_size"));
  m.def("fused_concat_and_store_mla_kv_cache", &at::native::fused_concat_and_store_mla_kv_cache, "fused_concat_and_store_mla_kv_cache");
- m.def("qkv_split_rms_rotary_embedding_fuse", &at::native::qkv_split_rms_rotary_embedding_fuse, "qkv_split_rms_rotary_embedding_fuse");
- m.def("gemma_qkv_split_rms_rotary_embedding_fuse", &at::native::gemma_qkv_split_rms_rotary_embedding_fuse, "gemma_qkv_split_rms_rotary_embedding_fuse");
- m.def("layer_norm_fwd_1pass_opt", &at::native::layer_norm_fwd_1pass_opt,
-       "layer_norm_fwd_1pass_opt",
-       py::arg("X"),
-       py::arg("Y"),
-       py::arg("W"),
-       py::arg("B"),
-       py::arg("Z"),
-       py::arg("Mean"),
-       py::arg("Rstd"),
-       py::arg("stride_x_row"),
-       py::arg("stride_y_row"),
-       py::arg("stride_z_row"),
-       py::arg("M"),
-       py::arg("N"),
-       py::arg("eps"),
-       py::arg("BLOCK_N"),
-       py::arg("ROWS_PER_BLOCK"),
-       py::arg("HAS_BIAS"),
-       py::arg("HAS_Z"),
-       py::arg("NORM_BEFORE_GATE"),
-       py::arg("IS_RMS_NORM"),
-       py::arg("ACTIVATION"));
+
+
  m.def("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert", &at::native::fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert");
  m.def("quantize_nope_fp8_rope_bf16_pack", &at::native::quantize_nope_fp8_rope_bf16_pack, "quantize_nope_fp8_rope_bf16_pack");
  m.def("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_int32", &at::native::fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_int32, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_int32");
@@ -1977,8 +1573,6 @@ m.def("main_kv_loc_to_compact", &at::native::main_kv_loc_to_compact, py::arg("lo
  m.def("fused_deepseek_v4_qnorm_rope_kvnorm_rope", &at::native::fused_deepseek_v4_qnorm_rope_kvnorm_rope, "fused_deepseek_v4_qnorm_rope_kvnorm_rope");
  m.def("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp", &at::native::fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp");
  m.def("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp_int32", &at::native::fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp_int32, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_pcp_int32");
- m.def("ep_build_m_indices", &at::native::ep_build_m_indices,"ep_build_m_indices");
- m.def("ep_fused_fp8_quant_scatter", &at::native::ep_fused_fp8_quant_scatter,"ep_fused_fp8_quant_scatter");
  m.def("quantize_nope_fp8_rope_bf16_pack_store", &at::native::quantize_nope_fp8_rope_bf16_pack_store, "quantize_nope_fp8_rope_bf16_pack_store");
  m.def("supports_mhc_repeat_cp_sglang", &at::native::supports_mhc_repeat_cp_sglang,
        "Metadata-only SGLang mHC repeat+CP preflight",
@@ -2017,42 +1611,7 @@ m.def("main_kv_loc_to_compact", &at::native::main_kv_loc_to_compact, py::arg("lo
        py::arg("page_size"),
        py::arg("seq_len_delta"),
        py::arg("use_swa"));
-m.def("moe_fused_gate_sqrtsoftplus",&at::native::moe_fused_gate_sqrtsoftplus,"moe_fused_gate_sqrtsoftplus");       
-m.def("bf16_mega_gate_hcu", &at::native::bf16_mega_gate_hcu,
-      py::arg("x"), py::arg("weight"), py::arg("num_topk"),
-      py::arg("use_shared_as_routed"), py::arg("num_shared_experts"),
-      py::arg("routed_scaling_factor"), py::arg("ep_rank"),
-      py::arg("scoring_func") = "sqrtsoftplus", py::arg("mask") = py::none(),
-      py::arg("bias") = py::none(), py::arg("image_bias") = py::none(),
-      py::arg("image_token_mask") = py::none(), py::arg("fix_routing_mask") = py::none(),
-      py::arg("to_physical_map") = py::none(), py::arg("logical_count") = py::none(),
-      py::arg("unmapped_topk_idx") = py::none(), py::arg("force_random") = py::none(),
-      py::arg("out") = py::none());
-m.attr("bf16_mega_gate_hcu_api_version") = 4;
-m.def("_bf16_mega_gate_hcu", &at::native::bf16_mega_gate_hcu_impl,
-      "HCU BF16 fused router with per-stream counters and managed scratch",
-      py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("topk") = 6,
-      py::arg("renormalize") = true, py::arg("routed_scaling_factor") = 1.0,
-      py::arg("apply_scale") = false, py::arg("out") = py::none(),
-      py::arg("mask") = py::none());
-m.def("moe_fused_gate_sqrtsoftplus_v41_hcu",&at::native::moe_fused_gate_sqrtsoftplus_v41_hcu,"moe_fused_gate_sqrtsoftplus_v41_hcu");
-m.def("moe_fused_gate_sqrtsoftplus_v41_hcu_fused",
-      &at::native::moe_fused_gate_sqrtsoftplus_v41_hcu_fused,
-      py::arg("input"), py::arg("bias"), py::arg("topk"),
-      py::arg("num_fused_shared_experts"), py::arg("renormalize"),
-      py::arg("routed_scaling_factor"),
-      py::arg("apply_routed_scaling_factor_on_output"),
-      py::arg("num_token_non_padded") = py::none());
-m.def("moe_fused_gate_sqrtsoftplus_v41_hcu_deepep",
-      &at::native::moe_fused_gate_sqrtsoftplus_v41_hcu_deepep,
-      py::arg("input"), py::arg("bias"), py::arg("topk"),
-      py::arg("num_fused_shared_experts"), py::arg("renormalize"),
-      py::arg("routed_scaling_factor"),
-      py::arg("apply_routed_scaling_factor_on_output"),
-      py::arg("num_token_non_padded") = py::none());
-m.def("fused_clamp_smooth", &at::native::fused_clamp_smooth, "fused_clamp_smooth");
-m.def("fused_deepep_prepare", &at::native::fused_deepep_prepare,
-      "fused_deepep_prepare");
+       
 m.def("fuse_silu_and_mul_ep",&at::native::fuse_silu_and_mul_ep,"fuse_silu_and_mul_ep");
 m.def(
      "topk_transform_512",
@@ -2083,15 +1642,14 @@ m.def("hcu_alloc_extend_kernel", &at::native::lightop_hcu_alloc_extend_kernel,
        py::arg("out_indices"),
        py::arg("bs"),
        py::arg("page_size"));
-m.def("mimo_v2_split_rope_vscale_kv_store", &at::native::mimo_v2_split_rope_vscale_kv_store, "mimo_v2_split_rope_vscale_kv_store");            
+            
   m.def("interleave_rows_", &lightop::cp_output::interleave_rows_,
         py::arg("gathered"), py::arg("cp_size"), py::arg("cycle_leaders"));
   m.def("make_interleave_plan_", &lightop::cp_output::make_interleave_plan_,
         py::arg("cycle_leaders"), py::arg("rows"), py::arg("cp_size"));
-  m.def("minimax_qk_norm_rope", &at::native::minimax_qk_norm_rope);
+
   m.def("minimax_cp_fp8_pack", &at::native::minimax_cp_fp8_pack);
   m.def("minimax_cp_cache_scatter", &at::native::minimax_cp_cache_scatter);
-  bind_prefill_sparse_fusion(m);
 }
 
 #endif  // focused extension or complete lightop.op

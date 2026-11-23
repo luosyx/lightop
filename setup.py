@@ -26,16 +26,13 @@ dtk_version = get_dtk_version(ROCM_HOME)
 torch_version = _get_pytorch_version_int()
 
 # Load metadata directly: importing lightop would require built extensions.
-_core = runpy.run_path(
-    str(Path(__file__).resolve().parent / "python/lightop/core.py")
-)
+REPO_ROOT = Path(__file__).resolve().parent
+_core = runpy.run_path(str(REPO_ROOT / "python/lightop/core.py"))
 MODULES = _core["MODULES"]
 try:
-    LIGHTOP_MODULES = _core["select_modules"](os.environ)
+    BUILD_OP, BUILD_STANDALONE, SELECTED_SPLIT_MODULES = _core["select_build_targets"](os.environ)
 except ValueError as exc:
     raise SystemExit(str(exc)) from None
-ENABLE_ANY_SPLIT = bool(LIGHTOP_MODULES)
-BUILD_FULL = not LIGHTOP_MODULES
 
 
 def _find_rocm_home() -> Optional[str]:
@@ -297,10 +294,17 @@ class BuildReleaseExtension(BuildExtension):
         super(BuildReleaseExtension, self).__init__(*args, **kwargs)
 
     def run(self):
+        if not self.dry_run:
+            _core["write_op_registry"](
+                REPO_ROOT, REPO_ROOT / "python/lightop/_op_registry.py"
+            )
         super().run()
         if not self.dry_run and self.extensions:
-            modules = ", ".join(LIGHTOP_MODULES) if LIGHTOP_MODULES else "full"
-            print(f"\n[LightOp] Build succeeded: {modules}")
+            built = []
+            if BUILD_OP:
+                built.append("op")
+            built.extend(SELECTED_SPLIT_MODULES)
+            print(f"\n[LightOp] Build succeeded: {', '.join(built)}")
 
     def build_extensions(self) -> None:
         self._check_abi()
@@ -391,177 +395,69 @@ class BuildReleaseExtension(BuildExtension):
                 if('-Wall' in extra_cc_cflags):
                     extra_cc_cflags.remove('-Wall')
                 print("release mode")
-            
-            marlin_w4a16_dir = os.path.abspath('./csrc/moe_marlin_gemm/w4a16/')
-            marlin_w4a8_dir = os.path.abspath('./csrc/moe_marlin_gemm/w4a8/')
-            marlin_w4fp8_dir = os.path.abspath('./csrc/moe_marlin_gemm/w4fp8/')  # 如果也需要特殊处理
 
-            marlin_w4a16_sources = []
-            marlin_w4a8_sources = []
-            marlin_w4fp8_sources = []
-            other_sources = []
+            arch_profile = getattr(self, '_current_arch_profile', 'default')
+            arch_flags_fn = {
+                'default': _get_rocm_arch_flags,
+                'marlin_w4a16': _get_rocm_arch_flags_marlin_w4a16,
+                'marlin_w4a8': _get_rocm_arch_flags_marlin_w4a8,
+            }.get(arch_profile)
+            if arch_flags_fn is None:
+                raise ValueError(f"Unknown arch_profile: {arch_profile!r}")
 
-            for s in sources:
-                abs_path = os.path.abspath(s)
-                if abs_path.startswith(marlin_w4a16_dir):
-                    marlin_w4a16_sources.append(s)
-                elif abs_path.startswith(marlin_w4a8_dir):
-                    marlin_w4a8_sources.append(s)
-                elif abs_path.startswith(marlin_w4fp8_dir):
-                    marlin_w4fp8_sources.append(s)
-                else:
-                    other_sources.append(s)
-            
-            marlin_w4a16_objects = [obj for src, obj in zip(sources, objects) if src in marlin_w4a16_sources]
-            marlin_w4a8_objects = [obj for src, obj in zip(sources, objects) if src in marlin_w4a8_sources]
-            marlin_w4fp8_objects = [obj for src, obj in zip(sources, objects) if src in marlin_w4fp8_sources]
-            other_objects = [obj for src, obj in zip(sources, objects) if src in other_sources]
-            
             with_cuda = any(map(_is_cuda_file, sources))
-            
-            # compile other
-            if other_sources:
+
+            if isinstance(extra_postargs, dict):
+                post_cflags = list(extra_postargs['cxx'])
+            else:
+                post_cflags = list(extra_postargs)
+            if IS_HIP_EXTENSION:
+                post_cflags = COMMON_HIP_FLAGS + post_cflags
+            append_cxx_std_if_no_std_present(post_cflags)
+
+            cuda_cflags = None
+            cuda_post_cflags = None
+            if with_cuda:
                 if isinstance(extra_postargs, dict):
-                    post_cflags = extra_postargs['cxx']
+                    cuda_post_cflags = list(extra_postargs['nvcc'])
                 else:
-                    post_cflags = list(extra_postargs)
+                    cuda_post_cflags = list(extra_postargs)
                 if IS_HIP_EXTENSION:
-                    post_cflags = COMMON_HIP_FLAGS + post_cflags
-                append_cxx_std_if_no_std_present(post_cflags)
-                
-                cuda_post_cflags = None
-                if with_cuda:
-                    if isinstance(extra_postargs, dict):
-                        cuda_post_cflags = extra_postargs['nvcc']
-                    else:
-                        cuda_post_cflags = list(extra_postargs)
-                    if IS_HIP_EXTENSION:
-                        cuda_post_cflags = cuda_post_cflags + _get_rocm_arch_flags(cuda_post_cflags)
-                        cuda_post_cflags = COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS + cuda_post_cflags
-                    append_cxx_std_if_no_std_present(cuda_post_cflags)
-                    cuda_cflags = [shlex.quote(f) for f in common_cflags]
-                    cuda_post_cflags = [shlex.quote(f) for f in cuda_post_cflags]
-                
-                _write_ninja_file_and_compile_objects(
-                    sources=other_sources, 
-                    objects=other_objects,
-                    cflags=[shlex.quote(f) for f in extra_cc_cflags + common_cflags],
-                    post_cflags=[shlex.quote(f) for f in post_cflags],
-                    cuda_cflags=cuda_cflags if with_cuda else None,
-                    cuda_post_cflags=cuda_post_cflags if with_cuda else None,
-                    build_directory=output_dir,
-                    verbose=True,
-                    with_cuda=with_cuda
-                )
-            
-            # compile w4a16
-            if marlin_w4a16_sources:
-                marlin_cxx_flags = ['-O3', '-w']
-                marlin_nvcc_flags = ['-O3', '-w']
-                if IS_HIP_EXTENSION:
-                    marlin_cxx_flags = COMMON_HIP_FLAGS + marlin_cxx_flags
-                append_cxx_std_if_no_std_present(marlin_cxx_flags)
+                    cuda_post_cflags = cuda_post_cflags + arch_flags_fn(cuda_post_cflags)
+                    cuda_post_cflags = COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS + cuda_post_cflags
+                append_cxx_std_if_no_std_present(cuda_post_cflags)
+                cuda_cflags = [shlex.quote(f) for f in common_cflags]
+                cuda_post_cflags = [shlex.quote(f) for f in cuda_post_cflags]
 
-                marlin_cuda_cflags = None
-                marlin_cuda_post_cflags = None
-                if with_cuda:
-                    marlin_cuda_cflags = [shlex.quote(f) for f in common_cflags]
-                    marlin_cuda_post_cflags = list(marlin_nvcc_flags)
-                    if IS_HIP_EXTENSION:
-                        marlin_cuda_post_cflags += _get_rocm_arch_flags_marlin_w4a16(marlin_cuda_post_cflags)
-                        marlin_cuda_post_cflags = COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS + marlin_cuda_post_cflags
-                    append_cxx_std_if_no_std_present(marlin_cuda_post_cflags)
-                    marlin_cuda_post_cflags = [shlex.quote(f) for f in marlin_cuda_post_cflags]
+            _write_ninja_file_and_compile_objects(
+                sources=sources,
+                objects=objects,
+                cflags=[shlex.quote(f) for f in extra_cc_cflags + common_cflags],
+                post_cflags=[shlex.quote(f) for f in post_cflags],
+                cuda_cflags=cuda_cflags,
+                cuda_post_cflags=cuda_post_cflags,
+                build_directory=output_dir,
+                verbose=True,
+                with_cuda=with_cuda
+            )
 
-                _write_ninja_file_and_compile_objects(
-                    sources=marlin_w4a16_sources,
-                    objects=marlin_w4a16_objects,
-                    cflags=[shlex.quote(f) for f in extra_cc_cflags + common_cflags],
-                    post_cflags=[shlex.quote(f) for f in marlin_cxx_flags],
-                    cuda_cflags=marlin_cuda_cflags,
-                    cuda_post_cflags=marlin_cuda_post_cflags,
-                    build_directory=output_dir,
-                    verbose=True,
-                    with_cuda=with_cuda
-                )
-            # compile w4a8
-            if marlin_w4a8_sources:
-                marlin_cxx_flags = ['-O3', '-w']
-                marlin_nvcc_flags = ['-O3', '-w']
-                if IS_HIP_EXTENSION:
-                    marlin_cxx_flags = COMMON_HIP_FLAGS + marlin_cxx_flags
-                append_cxx_std_if_no_std_present(marlin_cxx_flags)
-
-                marlin_cuda_cflags = None
-                marlin_cuda_post_cflags = None
-                if with_cuda:
-                    marlin_cuda_cflags = [shlex.quote(f) for f in common_cflags]
-                    marlin_cuda_post_cflags = list(marlin_nvcc_flags)
-                    if IS_HIP_EXTENSION:
-                        marlin_cuda_post_cflags += _get_rocm_arch_flags_marlin_w4a8(marlin_cuda_post_cflags)
-                        marlin_cuda_post_cflags = COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS + marlin_cuda_post_cflags
-                    append_cxx_std_if_no_std_present(marlin_cuda_post_cflags)
-                    marlin_cuda_post_cflags = [shlex.quote(f) for f in marlin_cuda_post_cflags]
-
-                _write_ninja_file_and_compile_objects(
-                    sources=marlin_w4a8_sources,
-                    objects=marlin_w4a8_objects,
-                    cflags=[shlex.quote(f) for f in extra_cc_cflags + common_cflags],
-                    post_cflags=[shlex.quote(f) for f in marlin_cxx_flags],
-                    cuda_cflags=marlin_cuda_cflags,
-                    cuda_post_cflags=marlin_cuda_post_cflags,
-                    build_directory=output_dir,
-                    verbose=True,
-                    with_cuda=with_cuda
-                )
-            # compile w4fp8
-            if marlin_w4fp8_sources:
-                marlin_cxx_flags = ['-O3', '-w']
-                marlin_nvcc_flags = ['-O3', '-w']
-                if IS_HIP_EXTENSION:
-                    marlin_cxx_flags = COMMON_HIP_FLAGS + marlin_cxx_flags
-                append_cxx_std_if_no_std_present(marlin_cxx_flags)
-
-                marlin_cuda_cflags = None
-                marlin_cuda_post_cflags = None
-                if with_cuda:
-                    marlin_cuda_cflags = [shlex.quote(f) for f in common_cflags]
-                    marlin_cuda_post_cflags = list(marlin_nvcc_flags)
-                    if IS_HIP_EXTENSION:
-                        marlin_cuda_post_cflags += _get_rocm_arch_flags_marlin_w4a8(marlin_cuda_post_cflags)
-                        marlin_cuda_post_cflags = COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS + marlin_cuda_post_cflags
-                    append_cxx_std_if_no_std_present(marlin_cuda_post_cflags)
-                    marlin_cuda_post_cflags = [shlex.quote(f) for f in marlin_cuda_post_cflags]
-
-                _write_ninja_file_and_compile_objects(
-                    sources=marlin_w4fp8_sources,
-                    objects=marlin_w4fp8_objects,
-                    cflags=[shlex.quote(f) for f in extra_cc_cflags + common_cflags],
-                    post_cflags=[shlex.quote(f) for f in marlin_cxx_flags],
-                    cuda_cflags=marlin_cuda_cflags,
-                    cuda_post_cflags=marlin_cuda_post_cflags,
-                    build_directory=output_dir,
-                    verbose=True,
-                    with_cuda=with_cuda
-                )
-            
-            return other_objects + marlin_w4a16_objects + marlin_w4a8_objects + marlin_w4fp8_objects
+            return objects
 
         self.compiler.compile = unix_wrap_ninja_compile
         build_ext.build_extensions(self)
 
     def build_extension(self, ext):
-        # Isolate Ninja state and object files for each split extension.
-        # Keep the default full build's existing temporary-directory layout.
-        if not ENABLE_ANY_SPLIT:
-            super().build_extension(ext)
-            return
+        # Always isolate Ninja state and object files per extension, since full builds
+        # compile both remaining lightop.op and split family extensions.
         orig_temp = self.build_temp
+        orig_profile = getattr(self, '_current_arch_profile', 'default')
         self.build_temp = os.path.join(
             orig_temp, str(ext.name).replace('.', '__'))
+        self._current_arch_profile = getattr(ext, '_arch_profile', 'default')
         try:
             super().build_extension(ext)
         finally:
+            self._current_arch_profile = orig_profile
             self.build_temp = orig_temp
 
 
@@ -636,13 +532,38 @@ def get_extensions():
         ('pybind', '*.cpp'),
     ]
 
+    def _expand_sources(patterns, mod_name):
+        resolved = []
+        for pattern in patterns:
+            if glob.has_magic(pattern):
+                matches = sorted(glob.glob(pattern))
+                if not matches:
+                    raise ValueError(f"{mod_name}: source pattern matched no files: {pattern}")
+                resolved.extend(matches)
+            else:
+                resolved.append(pattern)
+        return resolved
+
+    # Collect all sources owned by split modules so lightop.op never compiles them twice.
+    split_owned_sources = set()
+    resolved_split_sources = {}
+    for mod_name, spec in MODULES.items():
+        mod_srcs = _expand_sources(spec["sources"], mod_name)
+        mod_bindings = _expand_sources(spec["bindings"], mod_name)
+        resolved_split_sources[mod_name] = mod_srcs + mod_bindings
+        for path in mod_srcs + mod_bindings:
+            split_owned_sources.add(os.path.abspath(path))
+
     indexer_prep = "./csrc/kernels/mla/dsv41_indexer_prep.cu"
     op_files = []
-    if BUILD_FULL:
+    if BUILD_OP:
         for _src_dir, _src_pat in _CSRC_DIRS:
-            op_files += glob.glob(f'./csrc/{_src_dir}/{_src_pat}')
+            for src in sorted(glob.glob(f'./csrc/{_src_dir}/{_src_pat}')):
+                if os.path.abspath(src) not in split_owned_sources:
+                    op_files.append(src)
         # This source defines a standalone extension with stricter FP contraction.
-        op_files.remove(indexer_prep)
+        if indexer_prep in op_files:
+            op_files.remove(indexer_prep)
 
     extension = CUDAExtension
     # 迁移后只需要两个搜索根：csrc/ 与 csrc/include/。
@@ -653,8 +574,8 @@ def get_extensions():
     include_dirs.append(rocm_home+'/hiprand/include')
     include_dirs.append(rocm_home+'/rocrand/include')
     
-    if BUILD_FULL:
-        # Default full native extension.
+    if BUILD_OP:
+        # Remaining native extension after split families are extracted.
         ext_ops = extension(
             name="lightop.op",
             sources=op_files,
@@ -663,8 +584,9 @@ def get_extensions():
             library_dirs=[os.path.join(rocm_home, 'lib')],
             define_macros=define_macros,
             extra_compile_args=extra_compile_args)
-
         extensions.append(ext_ops)
+
+    if BUILD_STANDALONE:
         extensions.append(extension(
             name="lightop._router_gemm",
             sources=["./csrc/router/router_gemm.cu"],
@@ -676,32 +598,30 @@ def get_extensions():
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-ffp-contract=off"]},
         ))
 
-    # Each family supplies only its additions to the common build settings.
-    for name in LIGHTOP_MODULES:
+    # Each family supplies only its additions to the common build settings,
+    # except marlin arch profiles which use dedicated minimal flags.
+    for name in SELECTED_SPLIT_MODULES:
         spec = MODULES[name]
-        sources = []
-        for source in spec["sources"]:
-            if glob.has_magic(source):
-                matches = glob.glob(source)
-                if not matches:
-                    raise ValueError(f"{name}: source pattern matched no files: {source}")
-                sources.extend(matches)
-            else:
-                sources.append(source)
-        module_compile_args = {k: list(v) for k, v in extra_compile_args.items()}
+        arch_profile = spec["arch_profile"]
+        if arch_profile in ("marlin_w4a16", "marlin_w4a8"):
+            module_compile_args = {"cxx": ["-O3", "-w"], "nvcc": ["-O3", "-w"]}
+        else:
+            module_compile_args = {k: list(v) for k, v in extra_compile_args.items()}
         for compiler, flags in spec["extra_compile_args"].items():
             module_compile_args.setdefault(compiler, []).extend(flags)
-        extensions.append(extension(
+        mod_ext = extension(
             name=spec["extension"],
-            sources=sources,
+            sources=resolved_split_sources[name],
             include_dirs=list(include_dirs) + [
                 os.path.abspath(path) for path in spec["include_dirs"]
             ],
-            libraries=['rocblas', 'hipblas', 'hipblaslt'],
+            libraries=list(spec["libraries"]),
             library_dirs=[os.path.join(rocm_home, 'lib')],
             define_macros=define_macros,
             extra_compile_args=module_compile_args,
-        ))
+        )
+        mod_ext._arch_profile = arch_profile
+        extensions.append(mod_ext)
 
     return extensions
 
@@ -728,6 +648,10 @@ class BuildPyWithResources(build_py):
     """Copy repository-level runtime resources into the installed package."""
 
     def run(self):
+        if not self.dry_run:
+            _core["write_op_registry"](
+                REPO_ROOT, REPO_ROOT / "python/lightop/_op_registry.py"
+            )
         super().run()
         package_root = os.path.join(self.build_lib, "lightop")
         for source, destination in PACKAGE_RESOURCE_DIRS.items():
