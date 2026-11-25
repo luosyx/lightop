@@ -53,6 +53,7 @@
 // rows' Q in VGPRs) and is skipped below kPagedMqaLogitsFp4PairMinRequests.
 #include "hcu_mmac.h"
 #include "paged_mqa_logits_fp4.h"
+#include "paged_mqa_logits_fp4_native.hpp"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_runtime.h>
@@ -60,6 +61,34 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+// gfx946 has a native FP4 MMAC (v_mmac_f32_16x16x64_fp4, gated on
+// hcu-mmop6-insts; gfx938 rejects it).  It consumes raw E2M1, so the entire
+// software decode below -- the BF16 LUT, the FP8 pivot, the shift and edge
+// paths -- collapses into the instruction itself.
+//
+// It is opt-in because it has not been run on hardware: no gfx946 part is
+// reachable from the build nodes, so only its compilation, its codegen and a
+// host-side model of its indexing have been checked.  Build with
+// -DLIGHTOP_PAGED_FP4_NATIVE=1 to select it; the FP8 pivot path stays the
+// default on gfx946 until the native path has been validated on a part.
+#ifndef LIGHTOP_PAGED_FP4_NATIVE
+#define LIGHTOP_PAGED_FP4_NATIVE 0
+#endif
+
+#if defined(__gfx946__) && LIGHTOP_PAGED_FP4_NATIVE
+#define LIGHTOP_FP4_NATIVE_PATH 1
+#else
+#define LIGHTOP_FP4_NATIVE_PATH 0
+#endif
+
+// The FP8 pivot and the native path are alternative fast paths for the same
+// tiles; building both would keep two sets of Q fragments live for nothing.
+#if defined(__gfx938__) || (defined(__gfx946__) && !LIGHTOP_FP4_NATIVE_PATH)
+#define LIGHTOP_FP4_FP8_PATH 1
+#else
+#define LIGHTOP_FP4_FP8_PATH 0
+#endif
 
 namespace lightop::deep_gemm {
 namespace {
@@ -403,7 +432,17 @@ struct RowQ {
     float w[HT][4];
     // The row's smallest and largest Q scale, which bound the BF16 subnormal shift.
     int smin, smax;
-#if defined(__gfx938__) || defined(__gfx946__)
+#if LIGHTOP_FP4_NATIVE_PATH
+    // Native MMAC fragments: step s holds this lane's eight packed bytes of
+    // channels [64 s + 16 group, +16).  The same 16 bytes per head the decoded
+    // paths read, redistributed into the layout the K = 64 fragment wants.
+    intx2 nat[HT][fp4_native::kSteps];
+    // Packed UE8M0 scales of head h * 16 + j * 4 + group.  The accumulator's
+    // lane holds that head, which is not the head loaded into `nat`, so this
+    // follows the head-weight indexing rather than the fragment's.
+    int nat_sq[HT][4];
+#endif
+#if LIGHTOP_FP4_FP8_PATH
     // FP8 fragments exist only where the FP8 MMAC does; elsewhere they would
     // cost the fragments' VGPRs for nothing.
     intx2 f8[HT][4];
@@ -432,6 +471,19 @@ struct RowQ {
                 for (int k = 0; k < 8; ++k) bf[h][k] = decode_fp4x4((qb[h][k / 2] >> ((k & 1) * 16)) & 0xffffu, sq[h]);
             }
         }
+#if LIGHTOP_FP4_NATIVE_PATH
+#pragma unroll
+        for (int h = 0; h < HT; ++h) {
+            const uint8_t* row_base = q_fp4 +
+                (static_cast<int64_t>(r) * H + h * 16 + row) * kPayloadBytes;
+#pragma unroll
+            for (int s = 0; s < fp4_native::kSteps; ++s)
+                nat[h][s] = fp4_native::load_fragment(row_base, s, group);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                nat_sq[h][j] = q_sf[static_cast<int64_t>(r) * H + h * 16 + j * 4 + group];
+        }
+#endif
         smax = 0;
         smin = 255;
 #pragma unroll
@@ -441,7 +493,7 @@ struct RowQ {
         }
         smax = wave_max(smax);
         smin = wave_min(smin);
-#if defined(__gfx938__) || defined(__gfx946__)
+#if LIGHTOP_FP4_FP8_PATH
         pq = min(smax, smin + 5);
         fp8_ok = smax - smin <= 11;
 #pragma unroll
@@ -548,7 +600,7 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H, SharedB
         kb[tile] = uintx4{0, 0, 0, 0};
         if (payload[tile]) kb[tile] = *reinterpret_cast<const uintx4*>(payload[tile]);
     }
-#if defined(__gfx938__) || defined(__gfx946__)
+#if LIGHTOP_FP4_FP8_PATH
     if constexpr (SharedBf && H == 32 && TB == 64) {
         // A common K exponent gives pk == sk and an exact zero-offset FP8 conversion.
         // The data payload may have any E2M1 values. Fallback handles mixed scales.
@@ -655,6 +707,90 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H, SharedB
         qmin = min(qmin, q[1].smin);
         qmax = max(qmax, q[1].smax);
     }
+#if LIGHTOP_FP4_NATIVE_PATH
+    // Native FP4 MMAC.  A K = 64 MMAC spans two 32-channel scale groups and an
+    // MMAC reduces across lanes, so the two block scales cannot be divided out
+    // of the accumulator afterwards.  Lane groups outside the scale group being
+    // accumulated are therefore masked to zero, which leaves that MMAC's result
+    // carrying one uniform (sk, sq) pair, restored exactly on the FP32 partial
+    // sum.  Masking A alone suffices -- a zero A slice contributes nothing
+    // regardless of B -- so Q stays unmasked.  Four masked MMACs per head tile
+    // replace eight BF16 MMACs plus the whole table decode.
+    {
+        int nat_kmin = 255, nat_kmax = 0;
+#pragma unroll
+        for (int tile = 0; tile < kTilesPerWave; ++tile) {
+            const unsigned x = sw[tile];
+            const int b0 = x & 255u, b1 = (x >> 8) & 255u;
+            const int b2 = (x >> 16) & 255u, b3 = x >> 24;
+            nat_kmin = min(nat_kmin, min(min(b0, b1), min(b2, b3)));
+            nat_kmax = max(nat_kmax, max(max(b0, b1), max(b2, b3)));
+        }
+        nat_kmin = wave_min(nat_kmin);
+        nat_kmax = wave_max(nat_kmax);
+        // One masked accumulator holds at most 32 products of magnitude <= 36
+        // and its smallest nonzero term is 2^-2, so restoring by
+        // 2^(sk + sq - 254) stays inside the FP32 normal range for exponents in
+        // [-114, 114].  Scale 0 and 255 are not block scales a quantizer emits
+        // (255 is NaN in MX) and take the decoded path, which handles them.
+        const bool native_ok =
+            qmin >= 1 && qmax <= 254 && nat_kmin >= 1 && nat_kmax <= 254 &&
+            qmin + nat_kmin - 254 >= -114 && qmax + nat_kmax - 254 <= 114;
+        if (native_ok) {
+#pragma unroll
+            for (int tile = 0; tile < kTilesPerWave; ++tile) {
+                const int start = base + tile * kTile;
+                // Wave-uniform: the tail of a row's last split skips empty tiles.
+                if (start >= reach) break;
+                const int t = start + row;
+                // payload[] already carries this lane's decoded-path group
+                // offset; the native fragment wants a different slice of the
+                // same row, so back that offset out.
+                const uint8_t* krow = payload[tile] ? payload[tile] - group * 16 : nullptr;
+                intx2 kf[fp4_native::kSteps];
+#pragma unroll
+                for (int s = 0; s < fp4_native::kSteps; ++s)
+                    kf[s] = krow ? fp4_native::load_fragment(krow, s, group) : intx2{0, 0};
+#pragma unroll
+                for (int i = 0; i < Rows; ++i) {
+                    if (start >= visible[i]) continue;
+                    floatx4 dot[HT];
+#pragma unroll
+                    for (int h = 0; h < HT; ++h) dot[h] = floatx4{0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                    for (int sg = 0; sg < 4; ++sg) {
+                        const int step = sg >> 1, half = sg & 1;
+                        const int keep = (group >> 1) == half ? -1 : 0;
+                        const intx2 ka{kf[step][0] & keep, kf[step][1] & keep};
+                        const unsigned sk = (sw[tile] >> (sg * 8)) & 255u;
+                        floatx4 acc[HT];
+#pragma unroll
+                        for (int h = 0; h < HT; ++h) {
+                            acc[h] = floatx4{0.0f, 0.0f, 0.0f, 0.0f};
+                            acc[h] = fp4_native::mmac_fp4(ka, q[i].nat[h][step], acc[h]);
+                        }
+#pragma unroll
+                        for (int h = 0; h < HT; ++h) {
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                const unsigned sq =
+                                    (static_cast<unsigned>(q[i].nat_sq[h][j]) >> (sg * 8)) & 255u;
+                                dot[h][j] += fp4_native::apply_block_scale(acc[h][j], sk, sq);
+                            }
+                        }
+                    }
+                    // relu, the head weights and the cross-group reduction are
+                    // unchanged: the native path produces the same accumulator
+                    // layout the decoded paths do.
+                    const float logit = head_sum<HT>(dot, q[i].w);
+                    if (group == 0 && t < visible[i])
+                        a.out[(first + i) * a.out_stride + t] = logit;
+                }
+            }
+            return;
+        }
+    }
+#endif
     // Scales a quantizer emits need no shift and sit in [2, 252], where the
     // table decode is exact. One wave-uniform test per split -- some K scale
     // byte below max(130 - qmin, 2) or above 252, by the exact SWAR byte compare
@@ -689,7 +825,7 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H, SharedB
             shift = max(0, min(max(need, 2) - kmin, min(252 - kmax, 368 - qmax - kmax)));
         }
         bool need_bf16 = true;
-#if defined(__gfx938__) || defined(__gfx946__)
+#if LIGHTOP_FP4_FP8_PATH
         const int s0 = sw[tile] & 255u, s1 = (sw[tile] >> 8) & 255u;
         const int s2 = (sw[tile] >> 16) & 255u, s3 = sw[tile] >> 24;
         const int kmax = max(max(s0, s1), max(s2, s3));
@@ -732,7 +868,7 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H, SharedB
 #pragma unroll
             for (int h = 0; h < HT; ++h) acc[h] = floatx4{0.0f, 0.0f, 0.0f, 0.0f};
             float logit;
-#if defined(__gfx938__) || defined(__gfx946__)
+#if LIGHTOP_FP4_FP8_PATH
             if (fp8[i]) {
 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
