@@ -546,6 +546,16 @@ def get_extensions():
 
     # 全局默认编译选项
     extra_compile_args = {'cxx': ['-O3','-ldl', '-lrocblas','-w'], 'nvcc': ['-O3','-ldl', '-lrocblas','-w','-mllvm -enable-num-vgprs-512=true', '-DHIP_ENABLE_WARP_SYNC_BUILTINS']}
+    # gfx946 native FP4 MMAC (v_mmac_f32_16x16x64_fp4, hcu-mmop6-insts).
+    # Opt-in: the path is compiled out unless asked for, and is inert on every
+    # architecture other than gfx946.
+    #   LIGHTOP_PAGED_FP4_NATIVE=1        select the native path
+    #   LIGHTOP_PAGED_FP4_NATIVE_STRICT=1 make its fallback trap, so a test
+    #                                     cannot pass without executing it
+    if os.environ.get('LIGHTOP_PAGED_FP4_NATIVE') == '1':
+        extra_compile_args['nvcc'].append('-DLIGHTOP_PAGED_FP4_NATIVE=1')
+        if os.environ.get('LIGHTOP_PAGED_FP4_NATIVE_STRICT') == '1':
+            extra_compile_args['nvcc'].append('-DLIGHTOP_PAGED_FP4_NATIVE_STRICT=1')
     if torch_version_over110():
         extra_compile_args['nvcc'].append('-DTORCH_VERSION_OVER_110')
     if torch_version >= 290:

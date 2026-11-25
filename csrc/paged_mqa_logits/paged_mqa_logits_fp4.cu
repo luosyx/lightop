@@ -82,6 +82,17 @@
 #define LIGHTOP_FP4_NATIVE_PATH 0
 #endif
 
+// Test-only: make the native path's fallback fatal.  The eligibility gate
+// below sends out-of-range block scales to the decoded path, which returns the
+// same logits -- so a correctness test can pass without a single FP4 MMAC ever
+// issuing.  With strict mode on, that fallback traps instead, which is what
+// lets a test assert it actually exercised the native MMAC.  Never enable this
+// in a shipping build: scale 0 and 255 are legal inputs the decoded path
+// handles correctly.
+#ifndef LIGHTOP_PAGED_FP4_NATIVE_STRICT
+#define LIGHTOP_PAGED_FP4_NATIVE_STRICT 0
+#endif
+
 // The FP8 pivot and the native path are alternative fast paths for the same
 // tiles; building both would keep two sets of Q fragments live for nothing.
 #if defined(__gfx938__) || (defined(__gfx946__) && !LIGHTOP_FP4_NATIVE_PATH)
@@ -736,6 +747,10 @@ __device__ __forceinline__ void score_split(const Args& a, const RowQ<H, SharedB
         const bool native_ok =
             qmin >= 1 && qmax <= 254 && nat_kmin >= 1 && nat_kmax <= 254 &&
             qmin + nat_kmin - 254 >= -114 && qmax + nat_kmax - 254 <= 114;
+#if LIGHTOP_PAGED_FP4_NATIVE_STRICT
+        // A test build must not reach the decoded path unnoticed.
+        if (!native_ok) __builtin_trap();
+#endif
         if (native_ok) {
 #pragma unroll
             for (int tile = 0; tile < kTilesPerWave; ++tile) {
