@@ -171,20 +171,38 @@ __global__ __launch_bounds__(512) void bf16_mega_gate_kernel(
   }
   __shared__ float4_t partial[2 * 64];
   __shared__ int is_last;
+#if defined(__gfx946__) && LIGHTOP_ENABLE_GFX946_MEGA_GATE_EBARRIER
+  constexpr bool use_ebarrier = USE_MLS;
+#else
+  constexpr bool use_ebarrier = false;
+#endif
+  const auto sync_reduction = [] {
+    if constexpr (use_ebarrier) {
+      // All four GEMM waves arrive once per phase. Drain LDS stores before
+      // publishing partials and drain reads before allowing a slot overwrite.
+      __builtin_amdgcn_sched_barrier(0);
+      asm volatile("s_waitcnt lgkmcnt(0)\n\ts_ebarrier_sync 0, 4" ::: "memory");
+      __builtin_amdgcn_sched_barrier(0);
+    } else {
+      __syncthreads();
+    }
+  };
 #pragma unroll
   for (int tile = 0; tile < NT; ++tile) {
+    if (!use_ebarrier || wave < 4) {
 #pragma unroll
-    for (int active = 4; active > 1; active /= 2) {
-      const int half = active / 2;
-      if (wave >= half && wave < active)
-        partial[(wave - half) * 64 + lane] = acc[tile];
-      __syncthreads();
-      if (wave < half) {
-        const float4_t other = partial[wave * 64 + lane];
+      for (int active = 4; active > 1; active /= 2) {
+        const int half = active / 2;
+        if (wave >= half && wave < active)
+          partial[(wave - half) * 64 + lane] = acc[tile];
+        sync_reduction();
+        if (wave < half) {
+          const float4_t other = partial[wave * 64 + lane];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[tile][j] += other[j];
+          for (int j = 0; j < 4; ++j) acc[tile][j] += other[j];
+        }
+        sync_reduction();
       }
-      __syncthreads();
     }
     if (wave == 0) {
       float scores[4];
