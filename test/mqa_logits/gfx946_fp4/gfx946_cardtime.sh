@@ -20,7 +20,7 @@ MODE="${1:-full}"
 # Locate the repo from this script's own path (test/gfx946_fp4/), so the script
 # works regardless of the current directory or where the repo is checked out.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/../.." && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
 DIAG="$REPO/csrc/paged_mqa_logits/diagnostics"
 LOG="${TMPDIR:-/tmp}/gfx946_cardtime_$(date +%m%d_%H%M).log"
 exec > >(tee -a "$LOG") 2>&1
