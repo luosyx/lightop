@@ -47,19 +47,22 @@ __device__ __forceinline__ half4x2 restore_mmac_fragment(MlsPackedFragment packe
                                                         int lane) {
   const auto words = __builtin_bit_cast(MlsFragmentWords, packed);
   const int group = lane / 16;
-  const int source_lane = lane % 16 + (group % 2) * 32;
-  MlsFragmentWords even, odd;
+  const bool odd_group = group & 1;
+  const bool upper_half = group >= 2;
+  // DS splits these eight K values between adjacent lane groups. Each source
+  // lane selects which pair it sends on each route before the shuffle.
+  const int source_lane = lane % 16 + ((group & 1) * 2 + (group >> 1)) * 16;
+  const int paired_lane = source_lane ^ 16;
+  MlsFragmentWords restored;
 #pragma unroll
-  for (int word = 0; word < 4; ++word) {
-    even[word] = __shfl(words[word], source_lane, 64);
-    odd[word] = __shfl(words[word], source_lane + 16, 64);
+  for (int word = 0; word < 2; ++word) {
+    const int diagonal = __shfl(odd_group ? words[word + 2] : words[word],
+                                source_lane, 64);
+    const int exchanged = __shfl(odd_group ? words[word] : words[word + 2],
+                                 paired_lane, 64);
+    restored[word] = upper_half ? exchanged : diagonal;
+    restored[word + 2] = upper_half ? diagonal : exchanged;
   }
-  // DS distributes K in groups of four from each 16-element half. The
-  // original loads use eight consecutive K elements per lane, split over
-  // two MMACs. Restore that layout to preserve the FP32 accumulation order.
-  const int first_word = group < 2 ? 0 : 2;
-  const MlsFragmentWords restored = {even[first_word], even[first_word + 1],
-                                     odd[first_word], odd[first_word + 1]};
   return __builtin_bit_cast(half4x2, restored);
 }
 #endif
