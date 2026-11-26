@@ -20,9 +20,10 @@ namespace {
 constexpr int kMlsTileElements = 16 * 32;
 using MlsDescriptor = int __attribute__((ext_vector_type(4)));
 using MlsPackedFragment = short __attribute__((ext_vector_type(8)));
-using MlsFragmentWords = int __attribute__((ext_vector_type(4)));
+using MlsFragmentWords = unsigned __attribute__((ext_vector_type(4)));
 using LdsShort = short __attribute__((address_space(3)));
 
+template <bool WIDE>
 __device__ __forceinline__ void load_mls_tile(const BFloat16* source,
                                              unsigned lds_offset, int stride) {
   const auto address = reinterpret_cast<uintptr_t>(source);
@@ -30,40 +31,60 @@ __device__ __forceinline__ void load_mls_tile(const BFloat16* source,
       __builtin_amdgcn_readfirstlane(static_cast<unsigned>(address)),
       __builtin_amdgcn_readfirstlane(static_cast<unsigned>(address >> 32) & 0xffffu),
       stride, 0};
-  // K is contiguous. With T=1 each request covers 16 rows of 32 BF16s.
-  __builtin_hcu_matrix_load_32x16_b16(
-      descriptor, reinterpret_cast<LdsShort*>(static_cast<uintptr_t>(lds_offset)),
-      0, true, false, false, false, false);
+  // K is contiguous. Load one 16-row X tile or both 16-row W tiles at once.
+  auto* lds = reinterpret_cast<LdsShort*>(static_cast<uintptr_t>(lds_offset));
+  if constexpr (WIDE)
+    __builtin_hcu_matrix_load_32x32_b16(descriptor, lds, 0, true, false, false,
+                                       false, false);
+  else
+    __builtin_hcu_matrix_load_32x16_b16(descriptor, lds, 0, true, false, false,
+                                       false, false);
 }
 
-template <int BYTE_OFFSET>
+template <int BYTE_OFFSET, bool TRANSPOSE>
 __device__ __forceinline__ MlsPackedFragment read_mls_tile(unsigned lds_offset) {
-  return __builtin_hcu_ds_read_matrix_trans_format_i16(
-      reinterpret_cast<LdsShort*>(static_cast<uintptr_t>(lds_offset)),
-      BYTE_OFFSET, 2, 1, 0);
+  auto* lds = reinterpret_cast<LdsShort*>(static_cast<uintptr_t>(lds_offset));
+  if constexpr (TRANSPOSE)
+    return __builtin_hcu_ds_read_matrix_trans_format_i16(lds, BYTE_OFFSET, 2, 1, 0);
+  else
+    return __builtin_hcu_ds_read_matrix_format_i16(lds, BYTE_OFFSET, 2, 1, 0);
 }
 
-__device__ __forceinline__ half4x2 restore_mmac_fragment(MlsPackedFragment packed,
-                                                        int lane) {
+__device__ __forceinline__ unsigned pack_bf16_pair(unsigned low, unsigned high) {
+  return (low & 0xffffu) | (high << 16);
+}
+
+__device__ __forceinline__ half4x2 format_to_mmac(MlsPackedFragment packed,
+                                                int lane) {
   const auto words = __builtin_bit_cast(MlsFragmentWords, packed);
+  const int row = lane % 16;
   const int group = lane / 16;
-  const bool odd_group = group & 1;
-  const bool upper_half = group >= 2;
-  // DS splits these eight K values between adjacent lane groups. Each source
-  // lane selects which pair it sends on each route before the shuffle.
-  const int source_lane = lane % 16 + ((group & 1) * 2 + (group >> 1)) * 16;
-  const int paired_lane = source_lane ^ 16;
-  MlsFragmentWords restored;
+  const int row_in_group = row % 4;
+  // FORMAT's first four BF16s are four expert rows at K=lane%16.
+  // Its last four are the same rows at K+16. Pack those K halves together
+  // so one lane fetch supplies both MMACs. XOR pairs the source's K index
+  // with the destination's expert index within each 4x4 submatrix.
+  MlsFragmentWords adjacent_rows = {
+      pack_bf16_pair(words[0], words[2]),
+      pack_bf16_pair(words[0] >> 16, words[2] >> 16),
+      pack_bf16_pair(words[1], words[3]),
+      pack_bf16_pair(words[1] >> 16, words[3] >> 16),
+  };
+  MlsFragmentWords k_pairs;
 #pragma unroll
-  for (int word = 0; word < 2; ++word) {
-    const int diagonal = __shfl(odd_group ? words[word + 2] : words[word],
-                                source_lane, 64);
-    const int exchanged = __shfl(odd_group ? words[word] : words[word + 2],
-                                 paired_lane, 64);
-    restored[word] = upper_half ? exchanged : diagonal;
-    restored[word + 2] = upper_half ? diagonal : exchanged;
+  for (int exchange = 0; exchange < 4; ++exchange) {
+    const int source_lane = (row / 4) * 16 + group * 4 + (row_in_group ^ exchange);
+    k_pairs[exchange] = __shfl(adjacent_rows[row_in_group ^ exchange], source_lane, 64);
   }
-  return __builtin_bit_cast(half4x2, restored);
+
+  const unsigned k0 = k_pairs[row_in_group];
+  const unsigned k1 = k_pairs[row_in_group ^ 1];
+  const unsigned k2 = k_pairs[row_in_group ^ 2];
+  const unsigned k3 = k_pairs[row_in_group ^ 3];
+  const MlsFragmentWords result = {pack_bf16_pair(k0, k1), pack_bf16_pair(k2, k3),
+                                   pack_bf16_pair(k0 >> 16, k1 >> 16),
+                                   pack_bf16_pair(k2 >> 16, k3 >> 16)};
+  return __builtin_bit_cast(half4x2, result);
 }
 #endif
 
@@ -96,30 +117,31 @@ __global__ __launch_bounds__(512) void bf16_mega_gate_kernel(
     if (USE_MLS && (blockIdx.y + 1) * BM <= static_cast<unsigned>(m)) {
       static_assert(!USE_MLS || (!PADDED && HIDDEN == 5120 && EXPERT_CAPACITY == 384 &&
                                 TOP_K == 6));
-      __shared__ __align__(256) short wave_tiles[4][3][kMlsTileElements];
+      __shared__ __align__(1024) short wave_tiles[4][3][kMlsTileElements];
       constexpr int tile_bytes = kMlsTileElements * sizeof(short);
       const unsigned lds = __builtin_amdgcn_readfirstlane(
           static_cast<unsigned>(reinterpret_cast<uintptr_t>(&wave_tiles[wave][0][0])));
       const BFloat16* x_tile = x + blockIdx.y * BM * hidden;
       const BFloat16* w_tile = w + blockIdx.x * BN * hidden;
       for (int base = wave * 32; base < hidden; base += 128) {
-        load_mls_tile(x_tile + base, lds, hidden);
-        load_mls_tile(w_tile + base, lds + tile_bytes, hidden);
-        load_mls_tile(w_tile + 16 * hidden + base, lds + 2 * tile_bytes, hidden);
-        // All three non-bypass MLS loads must finish before the LDS reads.
+        load_mls_tile<false>(x_tile + base, lds, hidden);
+        load_mls_tile<true>(w_tile + base, lds + tile_bytes, hidden);
+        // Both non-bypass MLS loads must finish before the LDS reads.
         __builtin_amdgcn_sched_barrier(0);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __builtin_amdgcn_sched_barrier(0);
-        const auto packed_x = read_mls_tile<0>(lds);
-        const auto packed_w0 = read_mls_tile<tile_bytes>(lds);
-        const auto packed_w1 = read_mls_tile<2 * tile_bytes>(lds);
+        const auto packed_x = read_mls_tile<0, true>(lds);
+        const auto packed_w0 = read_mls_tile<0, false>(lds + tile_bytes);
+        const auto packed_w1 = read_mls_tile<tile_bytes, false>(lds + tile_bytes);
         // Wait for the wave-private tiles to be consumed before reusing them.
         __builtin_amdgcn_sched_barrier(0);
         asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         __builtin_amdgcn_sched_barrier(0);
-        const auto av = restore_mmac_fragment(packed_x, lane);
-        const auto bv0 = restore_mmac_fragment(packed_w0, lane);
-        const auto bv1 = restore_mmac_fragment(packed_w1, lane);
+        // X TRANS already holds K=4*group+[0..3,16..19]. The FORMAT
+        // conversion builds the same two K halves for each set of experts.
+        const auto av = __builtin_bit_cast(half4x2, packed_x);
+        const auto bv0 = format_to_mmac(packed_w0, lane);
+        const auto bv1 = format_to_mmac(packed_w1, lane);
         builtin_amdgcn_mmac<false>(bv0.data[0], av.data[0], acc[0]);
         builtin_amdgcn_mmac<false>(bv0.data[1], av.data[1], acc[0]);
         builtin_amdgcn_mmac<false>(bv1.data[0], av.data[0], acc[1]);
