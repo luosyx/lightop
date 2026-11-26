@@ -58,10 +58,16 @@ def build_inputs(device, *, heads, max_len, table_block_size, seed):
     slots_needed = blocks * table_block_size
     pages = max(1, (slots_needed + 63) // 64)
 
-    # Fused index-K pool page: [64 slots x 64 payload][64 slots x 4 scale]
-    kv = torch.empty((pages, 64, 1, 68), dtype=torch.uint8)
-    kv[..., :64] = torch.randint(0, 256, (pages, 64, 1, 64), generator=g, dtype=torch.uint8)
-    kv[..., 64:] = torch.randint(120, 135, (pages, 64, 1, 4), generator=g, dtype=torch.uint8)
+    # Fused index-K pool page, 4352 bytes.  The kernel addresses it as two
+    # contiguous regions, NOT as 68 bytes per slot:
+    #     payload  page + slot * 64            bytes [0, 4096)
+    #     scales   page + 64 * 64 + slot * 4   bytes [4096, 4352)
+    # Filling a [pages, 64, 1, 68] view per slot instead puts the scale bytes
+    # inside payload territory, and the kernel then reads random payload bytes
+    # as UE8M0 -- a byte of 255 becomes 2^128 and the logits overflow to inf.
+    kv = torch.empty((pages, 4352), dtype=torch.uint8)
+    kv[:, :4096] = torch.randint(0, 256, (pages, 4096), generator=g, dtype=torch.uint8)
+    kv[:, 4096:] = torch.randint(120, 135, (pages, 256), generator=g, dtype=torch.uint8)
 
     # slot = block_table[b, j // TB] * TB + j % TB  must stay inside pages*64,
     # so the entry bound depends on TB -- pages for TB=64, pages*8 for TB=8.
@@ -102,11 +108,20 @@ def run_all(device):
                         a["context_lens"], a["block_table"], schedule,
                         a["max_context_len"], a["table_block_size"])
             # Columns at or past context_lens[b] are left unwritten by contract,
-            # so they hold whatever was in the buffer -- mask them out.
+            # so they hold whatever the allocator left behind -- possibly NaN.
+            # Select rather than multiply: NaN * 0 is still NaN, and because
+            # every comparison against NaN is False, that would later make the
+            # tolerance check silently report a pass.
             cols = torch.arange(logits.shape[1], device=logits.device)
             mask = cols.unsqueeze(0) < a["context_lens"].unsqueeze(1).to(cols.device)
+            clean = torch.where(mask, logits, torch.zeros_like(logits))
+            if not torch.isfinite(clean).all():
+                raise RuntimeError(
+                    f"non-finite value inside the visible region of h{heads}/"
+                    f"len{max_len}/tb{tbs} -- a real operator bug, not an"
+                    " unwritten column")
             key = f"h{heads}_len{max_len}_tb{tbs}_{'persist' if persistent else 'grid'}"
-            results[key] = (logits * mask).float().cpu()
+            results[key] = clean.float().cpu()
             print(f"  {key}: {tuple(logits.shape)} ok")
 
     if not results:
@@ -144,14 +159,20 @@ def main():
     worst, worst_key, bad = 0.0, None, 0
     for k in sorted(ref):
         a, b = ref[k], got[k]
+        if not (torch.isfinite(a).all() and torch.isfinite(b).all()):
+            print(f"  {k}: NON-FINITE values present -> FAIL")
+            bad += 1
+            continue
         denom = a.abs().amax().clamp_min(1e-30)
         rel = ((b - a).abs().amax() / denom).item()
         if rel > worst:
             worst, worst_key = rel, k
-        status = "ok" if rel <= 1e-5 else "DIFF"
-        if rel > 1e-5:
+        # Phrased as `not (rel <= tol)` so a NaN fails: `rel > tol` would be
+        # False for NaN and would let a broken run report a pass.
+        failed = not (rel <= 1e-5)
+        if failed:
             bad += 1
-        print(f"  {k}: max rel {rel:.3g} {status}")
+        print(f"  {k}: max rel {rel:.3g} {'DIFF' if failed else 'ok'}")
 
     print(f"worst: {worst:.3g} at {worst_key}")
     if bad:
