@@ -7,18 +7,52 @@
 # compile, and it reports one verdict per stage.
 #
 #   bash gfx946_cardtime.sh            full run
-#   bash gfx946_cardtime.sh quick      stages 1-2 only (~2 min)
+#   bash gfx946_cardtime.sh quick      stages 0-2 only (~2 min)
+#
+# ---------------------------------------------------------------------------
+# REQUIRED ENVIRONMENT
+#
+# The script only checks these; it installs nothing, so that no card time is
+# spent on package downloads.  Stage 0 names whatever is missing.
+#
+#   GPU        a gfx946 part visible to torch.  gfx938 is not enough: the
+#              native MMAC is gated on hcu-mmop6-insts, which gfx938 lacks.
+#
+#   DTK        27.04-shb  (check: cat /opt/dtk/.dtk_version)
+#              Earlier DTKs do not ship __builtin_hcu_mmac_f32_16x16x64_fp4*.
+#              hipcc is expected at /opt/dtk/bin/hipcc.
+#
+#   torch      2.13.0+das.opt1.dtk2704, importable.
+#              If a container lacks it:
+#                pip install --no-deps 'http://10.16.1.201:9929/customer/\
+#                  dtk2704/+f/d6d/06607a8a9a9bc/torch-2.13.0+das.opt1.\
+#                  dtk2704.2611120915.ga6d2da-cp312-cp312-manylinux_2_28_\
+#                  x86_64.whl'
+#                pip install typing_extensions filelock fsspec sympy \
+#                  networkx jinja2 setuptools cloudpickle numpy
+#              The second line is needed because --no-deps installs the wheel
+#              but leaves `import torch` unsatisfiable.
+#              triton / flash_attn / vllm are NOT needed by this script.
+#
+#   repo       this checkout, writable (stage 3 does `pip install -e .`).
+#              git safe.directory must cover it if the mount is owned by
+#              another uid.
+#
+# Container that satisfies all of the above (image already has DTK 27.04-shb):
+#   10.16.1.152:5000/hcu/base/dtk:27.04-ubuntu22.04-py3.12
+# ---------------------------------------------------------------------------
 #
 # Stages
+#   0  environment   verify the above, install nothing
 #   1  sanity        device really is gfx946
 #   2  probe         native MMAC numerical test (settles the accumulator map)
-#   3  extension     build the python extension with the native path + strict
+#   3  extension     build the python extension twice: shipping, then native
 #   4  differential  operator output, native vs the shipping path
 #   5  benchmark     native vs shipping timing
 set -u
 MODE="${1:-full}"
-# Locate the repo from this script's own path (test/gfx946_fp4/), so the script
-# works regardless of the current directory or where the repo is checked out.
+# Locate the repo from this script's own path (test/mqa_logits/gfx946_fp4/), so
+# the script works regardless of the current directory or checkout location.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 DIAG="$REPO/csrc/paged_mqa_logits/diagnostics"
@@ -30,23 +64,28 @@ say() { printf '\n========== %s ==========\n' "$1"; }
 VERDICT=""
 note() { VERDICT="$VERDICT
 $1"; echo "$1"; }
+die() { note "$1"; echo "$VERDICT"; exit 1; }
 
 # ---------------------------------------------------------------- stage 0
+# Verify only.  Anything missing is reported against the header above rather
+# than fixed here, so card time is never spent downloading packages.
 say "0  environment"
-cd "$REPO" 2>/dev/null || { echo "repo not found at $REPO"; exit 1; }
-echo "DTK: $(cat /opt/dtk/.dtk_version 2>/dev/null || echo unknown)"
-if ! python3 -c 'import torch' 2>/dev/null; then
-  echo "torch missing -- installing the DTK 27.04 build"
-  python3 -m pip install -q --disable-pip-version-check --root-user-action=ignore --no-deps \
-   'http://10.16.1.201:9929/customer/dtk2704/+f/d6d/06607a8a9a9bc/torch-2.13.0+das.opt1.dtk2704.2611120915.ga6d2da-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=d6d06607a8a9a9bc59b7c32ee2755735dc05e8124d6753b96a544c100cd039d9' \
-   || { note "stage0 FAIL  torch install failed"; echo "$VERDICT"; exit 1; }
-  # --no-deps keeps the wheel from dragging in a mismatched stack, so the few
-  # modules torch actually imports have to be added by hand.
-  python3 -m pip install -q --disable-pip-version-check --root-user-action=ignore \
-    typing_extensions filelock fsspec sympy networkx jinja2 setuptools cloudpickle numpy
-fi
-python3 -c 'import torch; print("torch", torch.__version__)' \
-  || { note "stage0 FAIL  torch does not import"; echo "$VERDICT"; exit 1; }
+cd "$REPO" 2>/dev/null || die "stage0 FAIL  repo not found at $REPO"
+
+DTK_VER="$(cat /opt/dtk/.dtk_version 2>/dev/null | head -1)"
+echo "DTK:   ${DTK_VER:-<not found>}"
+case "$DTK_VER" in
+  *27.04-shb*) ;;
+  "")  die "stage0 FAIL  /opt/dtk/.dtk_version missing -- DTK 27.04-shb required" ;;
+  *)   note "stage0 WARN  DTK is '$DTK_VER', expected 27.04-shb;"
+       note "             the native builtins may not exist" ;;
+esac
+[ -x /opt/dtk/bin/hipcc ] || die "stage0 FAIL  /opt/dtk/bin/hipcc not executable"
+
+python3 -c 'import torch' 2>/dev/null \
+  || die "stage0 FAIL  torch not importable -- see REQUIRED ENVIRONMENT above"
+echo "torch: $(python3 -c 'import torch; print(torch.__version__)')"
+
 git config --global --add safe.directory "$REPO" 2>/dev/null
 note "stage0 PASS  environment ready"
 
