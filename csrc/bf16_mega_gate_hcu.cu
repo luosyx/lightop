@@ -7,6 +7,7 @@
 #include <hip/hip_runtime.h>
 
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 
 #include "moe_gate_utils.cuh"
@@ -15,9 +16,82 @@ namespace at {
 namespace native {
 namespace {
 
+#if defined(__gfx946__) && LIGHTOP_ENABLE_GFX946_MEGA_GATE_MLS
+constexpr int kMlsTileElements = 16 * 32;
+using MlsDescriptor = int __attribute__((ext_vector_type(4)));
+using MlsPackedFragment = short __attribute__((ext_vector_type(8)));
+using MlsFragmentWords = unsigned __attribute__((ext_vector_type(4)));
+using LdsShort = short __attribute__((address_space(3)));
+
+template <bool WIDE>
+__device__ __forceinline__ void load_mls_tile(const BFloat16* source,
+                                             unsigned lds_offset, int stride) {
+  const auto address = reinterpret_cast<uintptr_t>(source);
+  const MlsDescriptor descriptor = {
+      __builtin_amdgcn_readfirstlane(static_cast<unsigned>(address)),
+      __builtin_amdgcn_readfirstlane(static_cast<unsigned>(address >> 32) & 0xffffu),
+      stride, 0};
+  // K is contiguous. Load one 16-row X tile or both 16-row W tiles at once.
+  auto* lds = reinterpret_cast<LdsShort*>(static_cast<uintptr_t>(lds_offset));
+  if constexpr (WIDE)
+    __builtin_hcu_matrix_load_32x32_b16(descriptor, lds, 0, true, false, false,
+                                       false, false);
+  else
+    __builtin_hcu_matrix_load_32x16_b16(descriptor, lds, 0, true, false, false,
+                                       false, false);
+}
+
+template <int BYTE_OFFSET, bool TRANSPOSE>
+__device__ __forceinline__ MlsPackedFragment read_mls_tile(unsigned lds_offset) {
+  auto* lds = reinterpret_cast<LdsShort*>(static_cast<uintptr_t>(lds_offset));
+  if constexpr (TRANSPOSE)
+    return __builtin_hcu_ds_read_matrix_trans_format_i16(lds, BYTE_OFFSET, 2, 1, 0);
+  else
+    return __builtin_hcu_ds_read_matrix_format_i16(lds, BYTE_OFFSET, 2, 1, 0);
+}
+
+__device__ __forceinline__ unsigned pack_bf16_pair(unsigned low, unsigned high) {
+  return (low & 0xffffu) | (high << 16);
+}
+
+__device__ __forceinline__ half4x2 format_to_mmac(MlsPackedFragment packed,
+                                                int lane) {
+  const auto words = __builtin_bit_cast(MlsFragmentWords, packed);
+  const int row = lane % 16;
+  const int group = lane / 16;
+  const int row_in_group = row % 4;
+  // FORMAT's first four BF16s are four expert rows at K=lane%16.
+  // Its last four are the same rows at K+16. Pack those K halves together
+  // so one lane fetch supplies both MMACs. XOR pairs the source's K index
+  // with the destination's expert index within each 4x4 submatrix.
+  MlsFragmentWords adjacent_rows = {
+      pack_bf16_pair(words[0], words[2]),
+      pack_bf16_pair(words[0] >> 16, words[2] >> 16),
+      pack_bf16_pair(words[1], words[3]),
+      pack_bf16_pair(words[1] >> 16, words[3] >> 16),
+  };
+  MlsFragmentWords k_pairs;
+#pragma unroll
+  for (int exchange = 0; exchange < 4; ++exchange) {
+    const int source_lane = (row / 4) * 16 + group * 4 + (row_in_group ^ exchange);
+    k_pairs[exchange] = __shfl(adjacent_rows[row_in_group ^ exchange], source_lane, 64);
+  }
+
+  const unsigned k0 = k_pairs[row_in_group];
+  const unsigned k1 = k_pairs[row_in_group ^ 1];
+  const unsigned k2 = k_pairs[row_in_group ^ 2];
+  const unsigned k3 = k_pairs[row_in_group ^ 3];
+  const MlsFragmentWords result = {pack_bf16_pair(k0, k1), pack_bf16_pair(k2, k3),
+                                   pack_bf16_pair(k0 >> 16, k1 >> 16),
+                                   pack_bf16_pair(k2 >> 16, k3 >> 16)};
+  return __builtin_bit_cast(half4x2, result);
+}
+#endif
+
 // Four waves produce FP32 logits with the baseline K reduction order.
 // The last producer CTA uses all eight waves, two tokens per wave, for Top-K.
-template <int EXPERT_CAPACITY, int TOP_K, int HIDDEN = 0, bool PADDED = true>
+template <int EXPERT_CAPACITY, int TOP_K, int HIDDEN = 0, bool PADDED = true,
+          bool USE_MLS = false>
 __global__ __launch_bounds__(512) void bf16_mega_gate_kernel(
     const BFloat16* __restrict__ x, const BFloat16* __restrict__ w,
     const float* __restrict__ bias, const bool* __restrict__ mask,
@@ -39,40 +113,96 @@ __global__ __launch_bounds__(512) void bf16_mega_gate_kernel(
 #pragma unroll
   for (int tile = 0; tile < NT; ++tile) acc[tile] = {0, 0, 0, 0};
   if (wave < 4) {
-    for (int base = wave * 32; base < hidden; base += 128) {
-      const int offset = base + col_group * 8;
-      half4x2 av = {};
-      if (valid_row)
-        av = *reinterpret_cast<const half4x2*>(x + ar * hidden + offset);
+#if defined(__gfx946__) && LIGHTOP_ENABLE_GFX946_MEGA_GATE_MLS
+    if (USE_MLS && (blockIdx.y + 1) * BM <= static_cast<unsigned>(m)) {
+      static_assert(!USE_MLS || (!PADDED && HIDDEN == 5120 && EXPERT_CAPACITY == 384 &&
+                                TOP_K == 6));
+      __shared__ __align__(1024) short wave_tiles[4][3][kMlsTileElements];
+      constexpr int tile_bytes = kMlsTileElements * sizeof(short);
+      const unsigned lds = __builtin_amdgcn_readfirstlane(
+          static_cast<unsigned>(reinterpret_cast<uintptr_t>(&wave_tiles[wave][0][0])));
+      const BFloat16* x_tile = x + blockIdx.y * BM * hidden;
+      const BFloat16* w_tile = w + blockIdx.x * BN * hidden;
+      for (int base = wave * 32; base < hidden; base += 128) {
+        load_mls_tile<false>(x_tile + base, lds, hidden);
+        load_mls_tile<true>(w_tile + base, lds + tile_bytes, hidden);
+        // Both non-bypass MLS loads must finish before the LDS reads.
+        __builtin_amdgcn_sched_barrier(0);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
+        const auto packed_x = read_mls_tile<0, true>(lds);
+        const auto packed_w0 = read_mls_tile<0, false>(lds + tile_bytes);
+        const auto packed_w1 = read_mls_tile<tile_bytes, false>(lds + tile_bytes);
+        // Wait for the wave-private tiles to be consumed before reusing them.
+        __builtin_amdgcn_sched_barrier(0);
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        __builtin_amdgcn_sched_barrier(0);
+        // X TRANS already holds K=4*group+[0..3,16..19]. The FORMAT
+        // conversion builds the same two K halves for each set of experts.
+        const auto av = __builtin_bit_cast(half4x2, packed_x);
+        const auto bv0 = format_to_mmac(packed_w0, lane);
+        const auto bv1 = format_to_mmac(packed_w1, lane);
+        builtin_amdgcn_mmac<false>(bv0.data[0], av.data[0], acc[0]);
+        builtin_amdgcn_mmac<false>(bv0.data[1], av.data[1], acc[0]);
+        builtin_amdgcn_mmac<false>(bv1.data[0], av.data[0], acc[1]);
+        builtin_amdgcn_mmac<false>(bv1.data[1], av.data[1], acc[1]);
+      }
+    } else
+#endif
+    {
+      for (int base = wave * 32; base < hidden; base += 128) {
+        const int offset = base + col_group * 8;
+        half4x2 av = {};
+        if (valid_row)
+          av = *reinterpret_cast<const half4x2*>(x + ar * hidden + offset);
 #pragma unroll
-      for (int tile = 0; tile < NT; ++tile) {
-        const int br = blockIdx.x * BN + tile * 16 + row;
-        half4x2 bv = {};
-        if (!PADDED || br < experts)
-          bv = *reinterpret_cast<const half4x2*>(w + br * hidden + offset);
-        // Swapping operands makes each fragment span four tokens, so the
-        // gate can load consecutive expert scores without a transpose pass.
-        builtin_amdgcn_mmac<false>(bv.data[0], av.data[0], acc[tile]);
-        builtin_amdgcn_mmac<false>(bv.data[1], av.data[1], acc[tile]);
+        for (int tile = 0; tile < NT; ++tile) {
+          const int br = blockIdx.x * BN + tile * 16 + row;
+          half4x2 bv = {};
+          if (!PADDED || br < experts)
+            bv = *reinterpret_cast<const half4x2*>(w + br * hidden + offset);
+          // Swapping operands makes each fragment span four tokens, so the
+          // gate can load consecutive expert scores without a transpose pass.
+          builtin_amdgcn_mmac<false>(bv.data[0], av.data[0], acc[tile]);
+          builtin_amdgcn_mmac<false>(bv.data[1], av.data[1], acc[tile]);
+        }
       }
     }
   }
   __shared__ float4_t partial[2 * 64];
   __shared__ int is_last;
+#if defined(__gfx946__) && LIGHTOP_ENABLE_GFX946_MEGA_GATE_EBARRIER
+  constexpr bool use_ebarrier = USE_MLS;
+#else
+  constexpr bool use_ebarrier = false;
+#endif
+  const auto sync_reduction = [] {
+    if constexpr (use_ebarrier) {
+      // All four GEMM waves arrive once per phase. Drain LDS stores before
+      // publishing partials and drain reads before allowing a slot overwrite.
+      __builtin_amdgcn_sched_barrier(0);
+      asm volatile("s_waitcnt lgkmcnt(0)\n\ts_ebarrier_sync 0, 4" ::: "memory");
+      __builtin_amdgcn_sched_barrier(0);
+    } else {
+      __syncthreads();
+    }
+  };
 #pragma unroll
   for (int tile = 0; tile < NT; ++tile) {
+    if (!use_ebarrier || wave < 4) {
 #pragma unroll
-    for (int active = 4; active > 1; active /= 2) {
-      const int half = active / 2;
-      if (wave >= half && wave < active)
-        partial[(wave - half) * 64 + lane] = acc[tile];
-      __syncthreads();
-      if (wave < half) {
-        const float4_t other = partial[wave * 64 + lane];
+      for (int active = 4; active > 1; active /= 2) {
+        const int half = active / 2;
+        if (wave >= half && wave < active)
+          partial[(wave - half) * 64 + lane] = acc[tile];
+        sync_reduction();
+        if (wave < half) {
+          const float4_t other = partial[wave * 64 + lane];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[tile][j] += other[j];
+          for (int j = 0; j < 4; ++j) acc[tile][j] += other[j];
+        }
+        sync_reduction();
       }
-      __syncthreads();
     }
     if (wave == 0) {
       float scores[4];
@@ -138,8 +268,8 @@ void launch_router(const Tensor& x, const Tensor& w, const Tensor& bias,
   const int m = x.size(0), experts = w.size(0), hidden = x.size(1);
   const dim3 grid((experts + 31) / 32, (m + 15) / 16);
   const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-#define LAUNCH_ROUTER(H, PAD)                                               \
-  bf16_mega_gate_kernel<CAPACITY, TOP_K, H, PAD><<<grid, 512, 0, stream>>>( \
+#define LAUNCH_ROUTER(H, PAD, MLS)                                           \
+  bf16_mega_gate_kernel<CAPACITY, TOP_K, H, PAD, MLS><<<grid, 512, 0, stream>>>( \
       x.data_ptr<BFloat16>(), w.data_ptr<BFloat16>(),                       \
       bias.defined() ? bias.data_ptr<float>() : nullptr,                    \
       mask.defined() ? mask.data_ptr<bool>() : nullptr,                     \
@@ -149,11 +279,21 @@ void launch_router(const Tensor& x, const Tensor& w, const Tensor& bias,
       apply_scale)
   if constexpr (CAPACITY == 384 && TOP_K == 6) {
     if (experts == CAPACITY && hidden == 5120) {
-      LAUNCH_ROUTER(5120, false);
+#if LIGHTOP_ENABLE_GFX946_MEGA_GATE_MLS
+      if (m >= 128 && m <= 1025) {
+        const auto* props = at::cuda::getDeviceProperties(x.get_device());
+        const std::string_view arch(props->gcnArchName);
+        if (arch.substr(0, arch.find(':')) == "gfx946") {
+          LAUNCH_ROUTER(5120, false, true);
+          return;
+        }
+      }
+#endif
+      LAUNCH_ROUTER(5120, false, false);
       return;
     }
   }
-  LAUNCH_ROUTER(0, true);
+  LAUNCH_ROUTER(0, true, false);
 #undef LAUNCH_ROUTER
 }
 
